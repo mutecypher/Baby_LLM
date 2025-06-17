@@ -14,6 +14,7 @@ import mlx.optimizers as optim
 from transformers import AutoTokenizer, MarianMTModel, MarianTokenizer, pipeline, T5ForConditionalGeneration, T5Tokenizer
 from nltk.corpus import wordnet
 import nltk
+nltk.download('averaged_perceptron_tagger_eng')
 import random
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -27,7 +28,7 @@ from transformers import BertForMaskedLM
 import glob
 import string   
 from functools import partial 
-
+from secrets import HF_TOKEN, BERT_Token
 # Fix NLTK SSL issue and download required data
 try:
     _create_unverified_https_context = ssl._create_unverified_context
@@ -59,9 +60,6 @@ cleaned_dir = os.path.join(data_dir, "cleaned")
 tokenized_dir = os.path.join(data_dir, "tokenized")
 os.makedirs(cleaned_dir, exist_ok=True)
 os.makedirs(tokenized_dir, exist_ok=True)
-
-HF_TOKEN = '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'
-BERT_Token = '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'
 
 
 # Compiled regex patterns for cleaning
