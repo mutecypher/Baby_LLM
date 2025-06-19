@@ -1,4 +1,8 @@
 ## run with python 3.12
+## worked with numpy 2.3.0
+## worked with PyTorch 2.6.0
+## worked with Transformers 4.44.0
+
 import os
 import re
 import logging
@@ -13,6 +17,7 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+
 import torch
 import transformers
 from transformers import AutoTokenizer, MarianMTModel, MarianTokenizer, pipeline, T5ForConditionalGeneration, T5Tokenizer
@@ -34,12 +39,13 @@ from functools import partial
 from secrets import HF_TOKEN, BERT_Token
 # Fix NLTK SSL issue and download required data
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers.*")
+
 import multiprocessing
 multiprocessing.set_start_method('spawn', force=True)
 
-import warnings
-warnings.filterwarnings("ignore", message="A parameter name that contains")
-warnings.filterwarnings("ignore", message="Some weights of the model checkpoint")
+
 
 try:
     _create_unverified_https_context = ssl._create_unverified_context
@@ -912,8 +918,6 @@ def log_memory_usage():
 # Main block
 if __name__ == '__main__':
     # Suppress warnings
-    import warnings
-    warnings.filterwarnings('ignore', category=FutureWarning)
 
     # Pre-download NLTK resources
     nltk.download('averaged_perceptron_tagger_eng', quiet=True)
@@ -1312,7 +1316,7 @@ if __name__ == '__main__':
     # Pretraining loop
     for epoch in range(start_epoch_lm, num_epochs_lm):
         logging.info(f"Starting language modeling epoch {epoch + 1}/{num_epochs_lm}")
-        indices = mx.array(np.random.permutation(len(input_ids)))
+        indices = mx.random.permutation(len(input_ids))
         accumulated_grads = None
         print(f"Pretraining epoch {epoch + 1}")
         for i in range(0, len(input_ids), batch_size_lm):
