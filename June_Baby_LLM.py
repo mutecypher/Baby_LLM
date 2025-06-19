@@ -8,14 +8,21 @@ from pathlib import Path
 from hashlib import md5
 import psutil
 import numpy as np
+print("The version of numpy is ", np.__version__)
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+import torch
+print("PyTorch version ",torch.__version__)
+import transformers
+print("transfomers version ",transformers.__version__)
+print("MPS available:", torch.backends.mps.is_available())
 from transformers import AutoTokenizer, MarianMTModel, MarianTokenizer, pipeline, T5ForConditionalGeneration, T5Tokenizer
 from nltk.corpus import wordnet
 import nltk
 nltk.download('averaged_perceptron_tagger_eng')
 import random
+print("the random version is ",random.__file__)  # Should point to Python’s standard library
 import matplotlib.pyplot as plt
 from pathlib import Path
 import ssl
@@ -23,7 +30,7 @@ import evaluate
 import time
 from concurrent.futures import ProcessPoolExecutor
 from nltk import sent_tokenize, word_tokenize, pos_tag
-import torch
+
 from transformers import BertForMaskedLM
 import glob
 import string   
