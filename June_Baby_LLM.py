@@ -1,3 +1,4 @@
+## run with python 3.12
 import os
 import re
 import logging
@@ -7,26 +8,21 @@ import shutil
 from pathlib import Path
 from hashlib import md5
 import psutil
+import random
 import numpy as np
-print("The version of numpy is ", np.__version__)
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import torch
-print("PyTorch version ",torch.__version__)
 import transformers
-print("transfomers version ",transformers.__version__)
-print("MPS available:", torch.backends.mps.is_available())
 from transformers import AutoTokenizer, MarianMTModel, MarianTokenizer, pipeline, T5ForConditionalGeneration, T5Tokenizer
 from nltk.corpus import wordnet
 import nltk
-nltk.download('averaged_perceptron_tagger_eng')
-import random
-print("the random version is ",random.__file__)  # Should point to Python’s standard library
+
 import matplotlib.pyplot as plt
 from pathlib import Path
 import ssl
-import evaluate
+##import evaluate
 import time
 from concurrent.futures import ProcessPoolExecutor
 from nltk import sent_tokenize, word_tokenize, pos_tag
@@ -37,6 +33,14 @@ import string
 from functools import partial 
 from secrets import HF_TOKEN, BERT_Token
 # Fix NLTK SSL issue and download required data
+
+import multiprocessing
+multiprocessing.set_start_method('spawn', force=True)
+
+import warnings
+warnings.filterwarnings("ignore", message="A parameter name that contains")
+warnings.filterwarnings("ignore", message="Some weights of the model checkpoint")
+
 try:
     _create_unverified_https_context = ssl._create_unverified_context
 except AttributeError:
@@ -55,18 +59,14 @@ except LookupError:
     nltk.download('averaged_perceptron_tagger', quiet=True)
 
 # Setup logging
-logging.basicConfig(filename='qa_training.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    filename=f'qa_training_{multiprocessing.current_process().name}.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(processName)s - %(message)s'
+)
 
-# Directory setup
-base_dir = "~/Baby_LLM"
-cache_dir = os.path.expanduser(os.path.join(base_dir, "cache"))
-model_dir = os.path.expanduser(os.path.join(base_dir, "model"))
-data_dir = os.path.expanduser(os.path.join(base_dir, "data"))
-gutenberg_dir = os.path.join(data_dir, "gutenberg")
-cleaned_dir = os.path.join(data_dir, "cleaned")
-tokenized_dir = os.path.join(data_dir, "tokenized")
-os.makedirs(cleaned_dir, exist_ok=True)
-os.makedirs(tokenized_dir, exist_ok=True)
+
+
 
 
 # Compiled regex patterns for cleaning
@@ -85,27 +85,15 @@ fallback_metadata_patterns = [
     re.compile(r'This eBook is for the use of.*?\n', re.IGNORECASE),
 ]
 
-##patterns = [
-  ##  (re.compile(r'Scanned and proofed by.*?\n', re.IGNORECASE), ''),
-  ##  (re.compile(r'\[NOTE:.*?\]\n', re.DOTALL), ''),
-  ##  (re.compile(r'This eBook was produced by.*?\n', re.IGNORECASE), ''),
-  ##  (re.compile(r'^\s*[A-Z\s]+\n\s*TALES\s*\n', re.MULTILINE), ''),
-  ##  (re.compile(r'CONTENTS.*?(CHAPTER|BOOK|I\.|1\.)', re.DOTALL | re.IGNORECASE), ''),
-  ##  (re.compile(r'CHAPTER [IVXLC\d]+\..*?\n', re.IGNORECASE), ''),
-  ##  (re.compile(r'^\s*(I|II|III|IV|V|VI|VII|VIII|IX|X)\.\s.*?\n', re.MULTILINE), ''),
-  ##  (re.compile(r'BOOK THE (FIRST|SECOND|THIRD|FOURTH|FIFTH).*?\n', re.IGNORECASE), ''),
-  ##  (re.compile(r'\[.*?\]'), ''),
- ##   (re.compile(r'^\s*[A-Z\s]+[A-Z\s]+\.\s*$', re.MULTILINE), ''),
- ##   (re.compile(r'\*{3,}'), ''),
-  ##  (re.compile(r'^\s*[A-Z\s&]+\s*$', re.MULTILINE), ''),
-  ##  (re.compile(r'\b_+|_+\b'), ''),
-  ##  (re.compile(r'\*{2,}|\*\s+\*'), ''),
- ##   (re.compile(r'\s*&\s*'), ' and '),
-  ##  (re.compile(r'\n{3,}'), '\n\n'),
-  ##  (re.compile(r'End of the Project Gutenberg EBook.*?\n', re.IGNORECASE), ''),
-  ##  (re.compile(r'Updated editions will replace.*?\n', re.IGNORECASE), '')
-##]
-
+base_dir = "~/Baby_LLM"
+cache_dir = os.path.expanduser(os.path.join(base_dir, "cache"))
+model_dir = os.path.expanduser(os.path.join(base_dir, "model"))
+data_dir = os.path.expanduser(os.path.join(base_dir, "data"))
+gutenberg_dir = os.path.join(data_dir, "gutenberg")
+cleaned_dir = os.path.join(data_dir, "cleaned")
+tokenized_dir = os.path.join(data_dir, "tokenized")
+os.makedirs(cleaned_dir, exist_ok=True)
+os.makedirs(tokenized_dir, exist_ok=True)
 
 def preprocess_text(text):
     logging.debug(f"Preprocessing text: length={len(text)}, sample={text[:200]}")
@@ -252,22 +240,21 @@ def process_file(filename, tokenizer):
         return ""
 
 # Updated process_file_batch
-def process_file_batch(filenames, tokenizer, batch_size=73):
+def process_file_batch(filenames, tokenizer, batch_size=64):
     for i in range(0, len(filenames), batch_size):
         batch = filenames[i:i + batch_size]
         process_file_with_tokenizer = partial(process_file, tokenizer=tokenizer)
         try:
-            with ProcessPoolExecutor(max_workers=4) as executor:  # Limit workers to avoid resource exhaustion
+            with ProcessPoolExecutor(max_workers=4) as executor:
                 results = list(executor.map(process_file_with_tokenizer, batch))
             yield from results
         except Exception as e:
             logging.error(f"Multiprocessing batch {i//batch_size} failed: {str(e)}")
-            # Fallback to single-threaded processing for this batch
             results = [process_file_with_tokenizer(f) for f in batch]
             yield from results
         gc.collect()
         log_memory_usage()
-        
+
 def safe_remove(file_path):
     try:
         if os.path.exists(file_path):
@@ -678,9 +665,6 @@ def initialize_bert_pipeline(bert_token, cache_dir, max_retries=3):
 
 # Replace existing context_aware_synonym
 def context_aware_synonym(question, prob=0.3):
-    if fill_mask is None:
-        logging.warning("BERT fill-mask pipeline not available, skipping context-aware synonym replacement")
-        return question
     try:
         words = nltk.word_tokenize(question)
         pos_tags = nltk.pos_tag(words)
@@ -690,7 +674,7 @@ def context_aware_synonym(question, prob=0.3):
                 masked = words[:i] + ['[MASK]'] + words[i+1:]
                 masked_sent = ' '.join(masked)
                 try:
-                    predictions = fill_mask(masked_sent, top_k=1)
+                    predictions = fill_mask_pipeline(masked_sent, top_k=1)
                     new_words[i] = predictions[0]['token_str']
                 except Exception as e:
                     logging.debug(f"Failed to predict synonym for word '{word}': {str(e)}")
@@ -882,7 +866,7 @@ def generate_answer(model, tokenizer, prompt, max_tokens=50, beam_size=5):
     return clean_answer(output_text.split('Answer:')[-1].strip())
 
 # QA evaluation
-squad_metric = evaluate.load("squad")
+##squad_metric = evaluate.load("squad")
 
 def evaluate_qa(model, tokenizer, val_pairs):
     predictions = []
@@ -927,6 +911,30 @@ def log_memory_usage():
 
 # Main block
 if __name__ == '__main__':
+    # Suppress warnings
+    import warnings
+    warnings.filterwarnings('ignore', category=FutureWarning)
+
+    # Pre-download NLTK resources
+    nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+    nltk.download('punkt_tab', quiet=True)
+    nltk.download('wordnet', quiet=True)
+
+    # Print versions once
+    print("The version of numpy is ", np.__version__)
+    print("PyTorch version ", torch.__version__)
+    print("transfomers version ", transformers.__version__)
+    print("MPS available:", torch.backends.mps.is_available())
+    print("the random version is ", random.__file__)
+    print("About to start the directory setup")
+
+    # Logging setup per process
+    logging.basicConfig(
+        filename=f'qa_training_{multiprocessing.current_process().name}.log',
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(processName)s - %(message)s'
+    )
+
     # Create directories
     os.makedirs(cache_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
@@ -936,7 +944,13 @@ if __name__ == '__main__':
 
     # Load tokenizer
     try:
-        tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.3", token=HF_TOKEN, cache_dir=cache_dir,use_fast = False)
+        tokenizer = AutoTokenizer.from_pretrained(
+            "mistralai/Mistral-7B-v0.3",
+            token=HF_TOKEN,
+            cache_dir=cache_dir,
+            use_fast=False,
+            clean_up_tokenization_spaces=False
+        )
         logging.info("Tokenizer loaded successfully")
     except Exception as e:
         logging.error(f"Failed to load tokenizer: {str(e)}")
@@ -944,7 +958,9 @@ if __name__ == '__main__':
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_special_tokens({'sep_token': '<SEP>'})
 
+    # Initialize BERT pipeline
     initialize_bert_pipeline(BERT_Token, cache_dir)
+
     # Load and process Gutenberg corpus
     print("Loading and processing Gutenberg corpus...")
     start_time = time.time()
@@ -952,7 +968,6 @@ if __name__ == '__main__':
     try:
         filenames = os.listdir(gutenberg_dir)
         logging.info(f"Found {len(filenames)} files in {gutenberg_dir}")
-        ##filenames = filenames[:10]
         for result in process_file_batch(filenames, tokenizer):
             if result:
                 text += result

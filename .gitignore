@@ -26,6 +26,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 /Mistral_weights
+/venv310
 
 ## ignore files with tokens
 
