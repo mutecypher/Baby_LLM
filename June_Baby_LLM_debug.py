@@ -176,6 +176,7 @@ def preprocess_text(text):
     logging.debug(f"Preprocessed text: length={len(cleaned_text)}, sample={cleaned_text[:200]}")
     return cleaned_text
 
+
 def enhanced_clean_text(raw_text, tokenizer):
     logging.debug(f"Raw text length: {len(raw_text)}, sample: {raw_text[:200]}")
     text = raw_text
@@ -197,6 +198,7 @@ def enhanced_clean_text(raw_text, tokenizer):
     if unk_count > 0:
         logging.debug(f"Found {unk_count} <unk> tokens in cleaned text: {text[:200]}")
     return text
+
 
 def simple_strip_headers(text, include_dedication=True, filename="unknown"):
     # Normalize quotes and dashes before splitting
@@ -288,6 +290,16 @@ def is_narrative(text):
         logging.error(f"is_narrative failed: {str(e)}")
         return False
 
+def is_narrative(text):
+    if not isinstance(text, str) or not text.strip():
+        logging.warning("Invalid input to is_narrative: empty or non-string")
+        return False
+    try:
+        return len(text) > 20  # Only check for minimum length
+    except Exception as e:
+        logging.error(f"is_narrative failed for text (length={len(text)}): {str(e)}")
+        return False
+    
 def identify_high_tokens(tokenizer, vocab_size_threshold=0.9, sample_text=None):
     vocab_size = tokenizer.vocab_size
     threshold = int(vocab_size * vocab_size_threshold)  # e.g., 29494.8
@@ -321,18 +333,6 @@ def remove_high_token_content(text, high_tokens, replace_with="<unk>"):
     logging.debug("No high token patterns to remove")
     return text
     
-    pattern = "|".join(patterns)
-    try:
-        if replace_with:
-            cleaned_text = re.sub(pattern, replace_with, text, flags=re.UNICODE)
-            logging.debug(f"Replaced {len(re.findall(pattern, text))} high token instances with '{replace_with}'")
-        else:
-            cleaned_text = re.sub(pattern, "", text, flags=re.UNICODE)
-            logging.debug(f"Removed {len(re.findall(pattern, text))} high token instances")
-        return cleaned_text
-    except Exception as e:
-        logging.warning(f"Failed to remove high tokens: {str(e)}")
-        return text
 
 def process_file(filename, tokenizer, high_tokens=None):
     file_path = os.path.join(gutenberg_dir, filename)
