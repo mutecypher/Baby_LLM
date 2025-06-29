@@ -17,7 +17,9 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-
+from preprocessing_text import simple_strip_headers, preprocess_text, enhanced_clean_text
+from file_work import process_file, process_file_batch, log_memory_usage
+##
 import torch
 import transformers
 from transformers import BertForMaskedLM, AutoTokenizer, MarianMTModel, MarianTokenizer, pipeline, T5ForConditionalGeneration, T5Tokenizer
@@ -129,152 +131,6 @@ def log_listener(queue, log_file):
             continue
     file_handler.close()
 
-
-def preprocess_text(text):
-    logging.debug(f"Preprocessing text: length={len(text)}, sample={text[:200]}")
-    # Apply compiled regex patterns
-    for pattern in preprocess_patterns:
-        text = pattern.sub(' ', text)
-    # Create translation table to keep allowed characters, map others to None
-    allowed_chars = set(string.ascii_letters + string.digits + '.,?!\'"-;:() ')
-    trans_table = str.maketrans('', '', ''.join(chr(i) for i in range(128) if chr(i) not in allowed_chars))
-    filtered_text = text.translate(trans_table)
-    removed_count = len(text) - len(filtered_text)
-    logging.debug(f"Removed {removed_count} non-allowed characters")
-    cleaned_text = filtered_text.strip()
-    logging.debug(f"Preprocessed text: length={len(cleaned_text)}, sample={cleaned_text[:200]}")
-    return cleaned_text
-
-def enhanced_clean_text(raw_text):
-    logging.debug(f"Raw text length: {len(raw_text)}, sample: {raw_text[:200]}")
-    text = raw_text
-    for pattern, repl in patterns:
-        matches = pattern.findall(text)
-        if matches:
-            logging.debug(f"Pattern {pattern.pattern} matched {len(matches)} times, sample: {matches[:5]}")
-        text = pattern.sub(repl, text)
-    logging.debug(f"Final cleaned text: length={len(text)}, sample={text[:200]}")
-    return text.strip()
-
-def simple_strip_headers(text, include_dedication=True, filename="unknown"):
-    lines = text.splitlines()
-    total_lines = len(lines)
-    logging.debug(f"Total lines in text: {total_lines} for file {filename}")
-
-    first_gutenberg_idx = -1
-    for i, line in enumerate(lines):
-        if "gutenberg" in line.lower() or any(p.search(line) for p in fallback_metadata_patterns):
-            first_gutenberg_idx = i
-            logging.debug(f"Found start marker at line {i}: {line[:100]}")
-            break
-    if first_gutenberg_idx == -1:
-        logging.warning(f"No 'Gutenberg' or metadata markers found in {filename}; using fallback processing")
-        logging.debug(f"Sample lines from {filename}: {lines[:10]}")
-        start_idx = 0
-        for i, line in enumerate(lines[:100]):
-            line_lower = line.lower()
-            if any(term in line_lower for term in ["produced by", "ebook", "copyright", "transcriber", "prefatory note", "printed by"]):
-                start_idx = i + 1
-            elif len(line.strip()) > 20 and not re.match(r'^\s*(title|author|by|edited by|translated by)', line_lower):
-                break
-        end_idx = total_lines
-        for i in range(len(lines) - 1, -1, -1):
-            if re.search(r'\*{3}\s*END OF.*GUTENBERG EBOOK', lines[i], re.IGNORECASE):
-                end_idx = i
-                logging.debug(f"Found end marker at line {i}: {lines[i][:100]}")
-                break
-    else:
-        start_idx = min(first_gutenberg_idx + 10 + 1, total_lines)
-        last_gutenberg_idx = -1
-        for i in range(len(lines) - 1, -1, -1):
-            if "gutenberg" in lines[i].lower() or any(p.search(line) for p in fallback_metadata_patterns):
-                last_gutenberg_idx = i
-                logging.debug(f"Found end marker at line {i}: {lines[i][:100]}")
-                break
-        if last_gutenberg_idx == -1 or last_gutenberg_idx <= start_idx + 10:
-            end_idx = total_lines
-        else:
-            end_idx = max(last_gutenberg_idx - 10, start_idx)
-
-    stripped_lines = lines[start_idx:end_idx]
-    logging.debug(f"Stripped lines count for {filename}: {len(stripped_lines)}")
-    cleaned_lines = [line for line in stripped_lines if len(line.strip()) > 10]
-    stripped_text = "\n".join(cleaned_lines).strip()
-    if not stripped_text:
-        logging.warning(f"Empty output from simple_strip_headers for {filename}; using text after start_idx")
-        stripped_lines = lines[start_idx:total_lines]
-        cleaned_lines = [line for line in stripped_lines if len(line.strip()) > 5]
-        stripped_text = "\n".join(cleaned_lines).strip()
-        if not stripped_text:
-            logging.error(f"Still no content for {filename}; skipping")
-            return ""
-    return stripped_text
-    
-def process_file(filename, tokenizer):
-    file_path = os.path.join(gutenberg_dir, filename)
-    cleaned_file_path = os.path.join(cleaned_dir, f"{filename}.cleaned.txt")
-    logging.debug(f"Processing file: {filename}")
-    
-    if not os.path.isfile(file_path):
-        logging.warning(f"File not found: {filename}")
-        return ""
-    if os.path.getsize(file_path) > 10 * 1024 * 1024:
-        logging.info(f"Skipping {filename}: File too large (>10MB)")
-        return ""
-    
-    if os.path.exists(cleaned_file_path):
-        with open(cleaned_file_path, "r", encoding="utf-8") as f:
-            return f.read() + "\n\n"
-    
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            raw_text = f.read()
-        logging.info(f"Raw text length for {filename}: {len(raw_text)}")
-        stripped_text = simple_strip_headers(raw_text, include_dedication=True, filename=filename)
-        logging.info(f"Stripped text length: {len(stripped_text)}")
-        preprocessed_text = preprocess_text(stripped_text)
-        logging.info(f"Preprocessed text length: {len(preprocessed_text)}")
-        cleaned_text = enhanced_clean_text(preprocessed_text)
-        logging.info(f"Cleaned text length: {len(cleaned_text)}")
-        
-        if not cleaned_text.strip():
-            logging.warning(f"Empty cleaned text for {filename}")
-            return ""
-        
-        if len(cleaned_text) > 10:
-            with open(cleaned_file_path, "w", encoding="utf-8") as f:
-                f.write(cleaned_text)
-            logging.info(f"Saved cleaned file: {filename}")
-            return cleaned_text + "\n\n"
-        else:
-            logging.info(f"Skipping {filename}: Too short (length={len(cleaned_text)})")
-            return ""
-    except Exception as e:
-        logging.error(f"Error processing {filename}: {str(e)}")
-        return ""
-
-def is_narrative(text):
-    if not isinstance(text, str) or not text.strip():
-        logging.warning("Invalid input to is_narrative: empty or non-string")
-        return False
-    return len(text) > 10
-
-def process_file_batch(filenames, tokenizer, batch_size=32):
-    results = []
-    with ProcessPoolExecutor(max_workers=4) as executor:
-        for i in range(0, len(filenames), batch_size):
-            batch = filenames[i:i + batch_size]
-            future_to_file = {executor.submit(process_file, fname, tokenizer): fname for fname in batch}
-            for future in future_to_file:
-                try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
-                except Exception as e:
-                    logging.error(f"Error processing {future_to_file[future]}: {str(e)}")
-            gc.collect()
-            log_memory_usage()
-    return results
 
 def safe_remove(file_path):
     try:
@@ -1203,11 +1059,7 @@ def validate_model_params(model, step):
                 logging.error(f"NaN/Inf detected in parameter {name} at step {step}")
                 raise ValueError(f"Invalid parameters in {name}")
             
-def log_memory_usage():
-        process = psutil.Process(os.getpid())
-        mem_info = process.memory_info()
-        logging.info(f"Memory usage: RSS={mem_info.rss / 1024**2:.2f}MB, VMS={mem_info.vms / 1024**2:.2f}MB")
-            
+         
 
 #
 

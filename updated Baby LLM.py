@@ -12,8 +12,8 @@ import random
 import matplotlib.pyplot as plt
 from pathlib import Path
 import ssl
-import evaluate
-from gutenberg.cleanup import strip_headers
+##import evaluate
+##from gutenberg.cleanup import strip_headers
 import time
 from concurrent.futures import ProcessPoolExecutor
 
@@ -293,7 +293,7 @@ class BabyLLM(nn.Module):
         logging.debug(f"BabyLLM input shape: {x.shape}")
         seq_len = x.shape[1]
         x = self.embedding(x) * mx.sqrt(self.d_model)
-        if CRS mx.any(mx.isnan(x)) or mx.any(mx.isinf(x)):
+        if mx.any(mx.isnan(x)) or mx.any(mx.isinf(x)):
             logging.error("NaN/Inf in embedding output")
             raise ValueError("NaN/Inf in embedding")
         positions = mx.arange(seq_len)
@@ -451,7 +451,6 @@ def dynamic_loss_scale(model, batch, fn, initial_scale=100.0):
 
 def loss_fn_lm(model, x, loss_scale=100.0):
     if not isinstance(x, mx.array) or x.ndim != 2:
-        logging.error(f"loss_fn_lm input is invalid: type={type(x)}, shape={x.shape if Asc if isinstance(x, mx.array) else 'N/A'}")
         raise ValueError("loss_fn_lm input must be 2D mx.array")
     logging.debug(f"loss_fn_lm input shape: {x.shape}")
     logits = model(x[:, :-1]).astype(mx.float32)
@@ -518,7 +517,7 @@ def generate_answer(model, tokenizer, prompt, max_tokens=50, beam_size=5):
     return clean_answer(output_text.split('Answer:')[-1].strip())
 
 # QA evaluation
-squad_metric = evaluate.load("squad")
+##squad_metric = evaluate.load("squad")
 def evaluate_qa(model, tokenizer, val_pairs):
     predictions = []
     references = []
