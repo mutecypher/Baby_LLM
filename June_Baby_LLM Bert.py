@@ -135,12 +135,14 @@ def preprocess_text(text):
     # Apply compiled regex patterns
     for pattern in preprocess_patterns:
         text = pattern.sub(' ', text)
-    # Create translation table to keep allowed characters, map others to None
+    # Additional cleaning for Gutenberg artifacts
+    text = re.sub(r'\[\d+\]', '', text)  # Remove footnote markers
+    text = re.sub(r'CHAPTER [IVXLC]+', 'CHAPTER', text, flags=re.IGNORECASE)  # Normalize chapter headings
+    text = re.sub(r'\s+', ' ', text)  # Collapse multiple spaces
+    # Filter allowed characters
     allowed_chars = set(string.ascii_letters + string.digits + '.,?!\'"-;:() ')
     trans_table = str.maketrans('', '', ''.join(chr(i) for i in range(128) if chr(i) not in allowed_chars))
     filtered_text = text.translate(trans_table)
-    removed_count = len(text) - len(filtered_text)
-    logging.debug(f"Removed {removed_count} non-allowed characters")
     cleaned_text = filtered_text.strip()
     logging.debug(f"Preprocessed text: length={len(cleaned_text)}, sample={cleaned_text[:200]}")
     return cleaned_text
@@ -286,7 +288,7 @@ def safe_remove(file_path):
     except Exception as e:
         logging.warning(f"Failed to remove file {file_path}: {str(e)}")
         
-def load_or_tokenize_texts(texts, tokenizer, output_dir, prefix, batch_size=1000, max_length=128):
+def load_or_tokenize_texts(texts, tokenizer, output_dir, prefix, batch_size=500, max_length=128):
     os.makedirs(output_dir, exist_ok=True)
     inputs = []
     vocab_size_with_special = tokenizer.vocab_size + len(tokenizer.all_special_tokens)
@@ -294,19 +296,19 @@ def load_or_tokenize_texts(texts, tokenizer, output_dir, prefix, batch_size=1000
     # Validate input texts
     logging.info(f"Input texts: total={len(texts)}, sample={[t[:50] + '...' for t in texts[:5]]}")
     valid_texts = [t for t in texts if t.strip() and len(t.strip()) >= 10]
-    logging.info(f"Valid texts after initial filtering: total={len(valid_texts)}, sample={[t[:50] + '...' for t in valid_texts[:5]]}")
+    logging.info(f"Valid texts after initial filtering: total={len(valid_texts)}")
     
     if not valid_texts:
-        logging.error("No valid texts provided for tokenization after initial filtering")
+        logging.error("No valid texts provided for tokenization")
         raise ValueError("No valid texts provided for tokenization")
     
-    # Sort texts by token length and filter out excessively long sequences
+    # Sort texts by token length and filter
     text_lengths = []
     for t in valid_texts:
         try:
             token_ids = tokenizer(t, truncation=True, add_special_tokens=True)["input_ids"]
             length = len(token_ids)
-            if length < 5 or length > max_length * 10:  # Cap at 10x max_length (1280 tokens)
+            if length < 5 or length > max_length * 10:  # Cap at 1280 tokens
                 logging.warning(f"Skipping text with invalid token length: length={length}, text='{t[:50]}...'")
                 continue
             text_lengths.append((t, length))
@@ -315,13 +317,11 @@ def load_or_tokenize_texts(texts, tokenizer, output_dir, prefix, batch_size=1000
             continue
     
     text_lengths.sort(key=lambda x: x[1])
-    valid_texts = [t for t, length in text_lengths]
+    valid_texts = [t for t, _ in text_lengths]
     
     if not valid_texts:
-        logging.error("No texts with valid token length after filtering")
+        logging.error("No texts with valid token length")
         raise ValueError("No texts with valid token length")
-    
-    logging.info(f"Valid texts after token length filtering: total={len(valid_texts)}, sample={[t[:50] + '...' for t in valid_texts[:5]]}")
     
     for i in range(0, len(valid_texts), batch_size):
         batch_file = os.path.join(output_dir, f"{prefix}_batch_{i//batch_size}.npy")
@@ -331,42 +331,18 @@ def load_or_tokenize_texts(texts, tokenizer, output_dir, prefix, batch_size=1000
             logging.warning(f"Empty batch at index {i}")
             continue
         
-        # Adjust batch size based on max sequence length
-        batch_lengths = []
-        for t in batch:
-            try:
-                length = len(tokenizer(t, truncation=True, add_special_tokens=True)["input_ids"])
-                batch_lengths.append(length)
-            except Exception as e:
-                logging.warning(f"Failed to compute token length for text in batch {i//batch_size}: {str(e)}, text='{t[:50]}...'")
-                batch_lengths.append(max_length)  # Fallback to max_length
-        
-        max_batch_length = min(max(batch_lengths), max_length * 2)  # Cap at 2x max_length (256 tokens)
-        adjusted_batch_size = min(batch_size, int(batch_size * (max_length / max(max_batch_length, 1))))
-        adjusted_batch = batch[:adjusted_batch_size]
-        logging.info(f"Batch {i//batch_size}: max_length={max_batch_length}, adjusted_batch_size={len(adjusted_batch)}, sample={[t[:50] + '...' for t in adjusted_batch[:3]]}")
-        
-        if len(adjusted_batch) == 0:
-            logging.warning(f"Batch {i//batch_size} has adjusted_batch_size=0, skipping")
-            continue
-        
         # Check cached file
         if os.path.exists(batch_file) and os.path.exists(batch_checksum_file):
             try:
                 with open(batch_checksum_file, 'r') as f:
                     stored_checksum = f.read().strip()
-                with open(batch_file, 'rb') as f:
-                    current_checksum = md5(f.read()).hexdigest()
+                batch_text = ''.join(batch)
+                current_checksum = md5(batch_text.encode()).hexdigest()
                 if stored_checksum == current_checksum:
                     batch_inputs = np.load(batch_file)
-                    if batch_inputs.shape[1] != max_length:
-                        logging.warning(f"Batch {batch_file} has incorrect sequence length {batch_inputs.shape[1]}, retokenizing")
-                    elif np.any(batch_inputs < 0) or np.any(batch_inputs >= vocab_size_with_special):
-                        logging.warning(f"Corrupted tokens in {batch_file}, min={np.min(batch_inputs)}, max={np.max(batch_inputs)}, retokenizing")
-                    else:
-                        sample_decoded = [tokenizer.decode(batch_inputs[j], skip_special_tokens=False) for j in range(min(3, batch_inputs.shape[0]))]
-                        logging.info(f"Loaded cached batch {batch_file}, shape={batch_inputs.shape}, sample_decoded={sample_decoded}")
+                    if batch_inputs.shape[1] == max_length:
                         inputs.append(batch_inputs)
+                        logging.info(f"Loaded cached batch {batch_file}, shape={batch_inputs.shape}")
                         continue
             except Exception as e:
                 logging.warning(f"Failed to validate {batch_file}: {e}, retokenizing")
@@ -374,64 +350,37 @@ def load_or_tokenize_texts(texts, tokenizer, output_dir, prefix, batch_size=1000
         # Tokenize batch
         try:
             batch_inputs = tokenizer(
-                adjusted_batch,
+                batch,
                 return_tensors="np",
                 padding="max_length",
                 truncation=True,
-                max_length=max_length
+                max_length=max_length,
+                add_special_tokens=True
             )["input_ids"]
-            if tokenizer.pad_token_id is None:
-                logging.error("Tokenizer pad_token_id is None")
-                raise ValueError("Tokenizer pad_token_id is not set")
             non_pad_counts = np.sum(batch_inputs != tokenizer.pad_token_id, axis=1)
-            logging.info(f"Batch {i//batch_size} non_pad_counts: {non_pad_counts.tolist()}, min={np.min(non_pad_counts)}, max={np.max(non_pad_counts)}")
-            valid_mask = non_pad_counts > 2  # Relaxed threshold
+            valid_mask = non_pad_counts > 1  # Relaxed threshold for BERT
             if not np.any(valid_mask):
-                logging.warning(f"Batch {i//batch_size} has excessive padding, non_pad_counts={non_pad_counts.tolist()}, skipping")
+                logging.warning(f"Batch {i//batch_size} has excessive padding, non_pad_counts={non_pad_counts.tolist()}")
                 continue
             batch_inputs = batch_inputs[valid_mask]
             if np.any(batch_inputs < 0) or np.any(batch_inputs >= vocab_size_with_special):
-                logging.error(f"Invalid tokens in batch at index {i}: min={np.min(batch_inputs)}, max={np.max(batch_inputs)}")
-                np.save(os.path.join(output_dir, f"invalid_batch_{i}.npy"), batch_inputs)
-                sample_decoded = [tokenizer.decode(batch_inputs[j], skip_special_tokens=False) for j in range(min(3, batch_inputs.shape[0]))]
-                logging.error(f"Sample invalid sequences: {sample_decoded}")
+                logging.error(f"Invalid tokens in batch {i//batch_size}: min={np.min(batch_inputs)}, max={np.max(batch_inputs)}")
                 continue
-            sample_decoded = [tokenizer.decode(batch_inputs[j], skip_special_tokens=False) for j in range(min(3, batch_inputs.shape[0]))]
-            logging.info(f"Tokenized batch {i//batch_size}, shape={batch_inputs.shape}, sample_decoded={sample_decoded}")
             np.save(batch_file, batch_inputs)
-            with open(batch_file, 'rb') as f:
-                checksum = md5(f.read()).hexdigest()
             with open(batch_checksum_file, 'w') as f:
-                f.write(checksum)
-            logging.info(f"Saved tokenized batch to {batch_file} with checksum, shape={batch_inputs.shape}")
+                f.write(md5(batch_text.encode()).hexdigest())
             inputs.append(batch_inputs)
+            logging.info(f"Saved tokenized batch {batch_file}, shape={batch_inputs.shape}")
         except Exception as e:
-            logging.error(f"Tokenization failed for batch at index {i}: {str(e)}")
-            sample_texts = [t[:50] + '...' for t in adjusted_batch[:3]]
-            logging.error(f"Sample texts in failed batch: {sample_texts}")
+            logging.error(f"Tokenization failed for batch {i//batch_size}: {str(e)}")
             continue
     
     if not inputs:
-        logging.error("No valid batches tokenized after processing all texts")
+        logging.error("No valid batches tokenized")
         raise ValueError("No valid batches tokenized")
     
-    logging.info("Inspecting batch shapes before concatenation:")
-    for idx, batch_input in enumerate(inputs):
-        logging.info(f"Batch {idx} shape: {batch_input.shape}")
-    
-    try:
-        input_ids = mx.array(np.concatenate(inputs, axis=0), dtype=mx.int32)
-    except Exception as e:
-        logging.error(f"Failed to concatenate inputs: {str(e)}")
-        for idx, batch_input in enumerate(inputs):
-            logging.error(f"Batch {idx} shape: {batch_input.shape}")
-            np.save(os.path.join(output_dir, f"concat_error_batch_{idx}.npy"), batch_input)
-        raise
-    
-    non_pad_counts = mx.sum(input_ids != tokenizer.pad_token_id, axis=1)
-    padding_ratio = 1 - mx.mean(input_ids != tokenizer.pad_token_id).item()
-    logging.info(f"{prefix} non_pad_counts: {non_pad_counts.tolist()}")
-    logging.info(f"{prefix} padding_ratio: {padding_ratio:.2f}")
+    input_ids = mx.array(np.concatenate(inputs, axis=0), dtype=mx.int32)
+    logging.info(f"Tokenized {prefix} shape: {input_ids.shape}")
     return input_ids
 
 # Custom learning rate scheduler
@@ -1269,24 +1218,41 @@ if __name__ == '__main__':
         os.makedirs(tokenized_dir, exist_ok=True)
 
         # Load tokenizer
+ # Load tokenizer
         try:
             tokenizer = AutoTokenizer.from_pretrained(
-                "mistralai/Mistral-7B-v0.3",
+                "bert-base-uncased",
                 token=HF_TOKEN,
                 cache_dir=cache_dir,
-                use_fast=False,
-                clean_up_tokenization_spaces=True
+                use_fast=True  # Use fast tokenizer for efficiency
             )
             logging.info("Tokenizer loaded successfully")
-            if tokenizer.vocab_size < 1000 or not tokenizer.eos_token:
-                logging.error("Invalid tokenizer configuration")
-                raise ValueError("Invalid tokenizer")
-            tokenizer.pad_token = tokenizer.eos_token
+            
+            # Set pad_token and eos_token explicitly
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = '[PAD]'  # BERT's default padding token
+                tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids('[PAD]')
+            if tokenizer.eos_token is None:
+                tokenizer.eos_token = '[SEP]'  # Use [SEP] as a proxy for EOS
+                tokenizer.eos_token_id = tokenizer.convert_tokens_to_ids('[SEP]')
+            
+            # Add custom SEP token if needed
             tokenizer.add_special_tokens({'sep_token': '<SEP>'})
+            
+            # Update vocab size with special tokens
+            vocab_size_with_special = tokenizer.vocab_size + len(tokenizer.all_special_tokens)
+            
+            # Validate tokenizer configuration
+            if tokenizer.vocab_size < 1000 or tokenizer.pad_token_id is None or tokenizer.eos_token_id is None:
+                logging.error(f"Invalid tokenizer configuration: vocab_size={tokenizer.vocab_size}, "
+                            f"pad_token_id={tokenizer.pad_token_id}, eos_token_id={tokenizer.eos_token_id}")
+                raise ValueError("Invalid tokenizer configuration")
+            
+            logging.info(f"Tokenizer special tokens: bos={tokenizer.bos_token_id}, eos={tokenizer.eos_token_id}, "
+                        f"pad={tokenizer.pad_token_id}, sep={tokenizer.sep_token_id}, vocab_size={vocab_size_with_special}")
         except Exception as e:
             logging.error(f"Failed to load tokenizer: {str(e)}")
             raise
-
         # In main block, after loading tokenizer
         tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
         logging.info(f"Tokenizer pad_token: {tokenizer.pad_token}, pad_token_id: {tokenizer.pad_token_id}")
@@ -1339,8 +1305,25 @@ if __name__ == '__main__':
         log_memory_usage()
 
         # Split texts
-        texts = [t for t in text.split("\n\n") if t.strip() and len(t.strip()) >= 10]
-        logging.info(f"Split texts: total={len(texts)}, sample={[t[:50] + '...' for t in texts[:5]]}")
+        # In main block, after splitting texts
+        texts = []
+        for t in text.split("\n\n"):
+            if t.strip():
+                sentences = sent_tokenize(t)
+                # Concatenate short sentences
+                current_text = ""
+                for s in sentences:
+                    if len(current_text) + len(s) < 1000:  # Arbitrary max length
+                        current_text += " " + s
+                    else:
+                        if current_text.strip() and len(current_text) > 10:
+                            texts.append(current_text.strip())
+                        current_text = s
+                if current_text.strip() and len(current_text) > 10:
+                    texts.append(current_text.strip())
+        logging.info(f"Collected {len(texts)} texts after concatenation, sample={[t[:50] + '...' for t in texts[:5]]}")
+                
+                
         max_size = 20 * 1024 * 1024 * 1024  # 20GB
         current_size = 0
         filtered_texts = []
