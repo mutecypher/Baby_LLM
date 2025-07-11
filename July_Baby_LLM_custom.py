@@ -124,7 +124,7 @@ def log_listener(queue, log_file):
         except multiprocessing.queues.Empty:
             logging.debug("Log queue timeout, continuing...")
             continue
-        except queue.Full:
+        except queue.full:
             print("Warning: Log queue full, some logs may be dropped", file=sys.stderr)
             continue
         except Exception as e:
@@ -399,12 +399,21 @@ def flatten_parameters(params, prefix=""):
     for key, value in params.items():
         new_key = f"{prefix}{key}" if prefix else key
         if isinstance(value, mx.array):
-            flat_params[new_key] = np.array(value, dtype=np.float16)
+            try:
+                # Ensure float16 and check for NaN/Inf
+                mx_value = value.astype(mx.float16)
+                if mx.any(mx.isnan(mx_value)) or mx.any(mx.isinf(mx_value)):
+                    logging.error(f"NaN/Inf detected in parameter {new_key}")
+                    raise ValueError(f"NaN/Inf in parameter {new_key}")
+                flat_params[new_key] = mx_value
+            except Exception as e:
+                logging.error(f"Failed to process parameter {new_key}: {str(e)}")
+                raise
         elif isinstance(value, dict):
             flat_params.update(flatten_parameters(value, f"{new_key}."))
         elif isinstance(value, list) and key == "layers":
             for i, layer in enumerate(value):
-                if isinstance(layer, dict):  # Handle MLX's parameter dictionaries
+                if isinstance(layer, dict):
                     layer_params = flatten_parameters(layer, f"{new_key}.{i}.")
                     flat_params.update(layer_params)
                 else:
@@ -413,6 +422,138 @@ def flatten_parameters(params, prefix=""):
             logging.warning(f"Skipping non-array parameter {new_key}: type={type(value)}")
     return flat_params
 
+def load_checkpoint(model, optimizer, checkpoint_path, model_dir):
+    """
+    Load the latest model and optimizer state from a checkpoint if available.
+    Returns the model, optimizer state, and the starting epoch.
+    """
+    import glob
+    checkpoint_files = glob.glob(os.path.join(model_dir, "checkpoint_epoch_*.npz"))
+    legacy_checkpoint = os.path.join(model_dir, "pretrain_checkpoint.npz")  # Support original checkpoint
+
+    # Check for legacy checkpoint
+    if os.path.exists(legacy_checkpoint):
+        logging.info(f"Found legacy checkpoint: {legacy_checkpoint}, loading as epoch 0")
+        try:
+            checkpoint = mx.load(legacy_checkpoint)
+            flat_params = flatten_parameters(model.parameters())
+            for key, value in checkpoint.items():
+                if key in flat_params:
+                    flat_params[key] = mx.array(value, dtype=mx.float16)
+                else:
+                    logging.warning(f"Skipping unexpected key in legacy checkpoint: {key}")
+
+            def unflatten_parameters(flat_params, model):
+                params = model.parameters()
+                for key, value in flat_params.items():
+                    keys = key.split('.')
+                    current = params
+                    for k in keys[:-1]:
+                        if k.isdigit():
+                            current = current['layers'][int(k)]
+                        else:
+                            current = current[k]
+                    current[keys[-1]] = value
+                model.update(params)
+
+            unflatten_parameters(flat_params, model)
+            validate_model_params(model, step=0)
+            logging.info("Legacy model parameters loaded and validated successfully")
+
+            # Check for legacy optimizer state
+            legacy_optimizer_state_file = legacy_checkpoint.replace('.npz', '_optimizer.npz')
+            if os.path.exists(legacy_optimizer_state_file):
+                optimizer_state = mx.load(legacy_optimizer_state_file)
+                optimizer.state = optimizer_state
+                logging.info("Legacy optimizer state loaded successfully")
+            else:
+                logging.warning("No legacy optimizer state found, reinitializing optimizer")
+                optimizer.reset()
+
+            return model, optimizer.state, 0  # Start from epoch 0 for legacy checkpoint
+        except Exception as e:
+            logging.error(f"Failed to load legacy checkpoint {legacy_checkpoint}: {str(e)}")
+            raise
+
+    # Check for epoch-based checkpoints
+    if not checkpoint_files:
+        logging.info("No epoch-based checkpoints found, starting training from scratch")
+        return model, optimizer.state, 0
+
+    # Find the latest checkpoint by epoch number
+    try:
+        latest_checkpoint = max(checkpoint_files, key=lambda x: int(os.path.basename(x).split('_epoch_')[1].split('.npz')[0]))
+        epoch = int(os.path.basename(latest_checkpoint).split('_epoch_')[1].split('.npz')[0])
+        logging.info(f"Found checkpoint: {latest_checkpoint}, resuming from epoch {epoch}")
+    except (IndexError, ValueError) as e:
+        logging.error(f"Error parsing checkpoint filenames: {str(e)}")
+        logging.info("Starting training from scratch due to invalid checkpoint names")
+        return model, optimizer.state, 0
+
+    try:
+        checkpoint = mx.load(latest_checkpoint)
+        flat_params = flatten_parameters(model.parameters())
+        for key, value in checkpoint.items():
+            if key in flat_params:
+                flat_params[key] = mx.array(value, dtype=mx.float16)
+            else:
+                logging.warning(f"Skipping unexpected key in checkpoint: {key}")
+
+        def unflatten_parameters(flat_params, model):
+            params = model.parameters()
+            for key, value in flat_params.items():
+                keys = key.split('.')
+                current = params
+                for k in keys[:-1]:
+                    if k.isdigit():
+                        current = current['layers'][int(k)]
+                    else:
+                        current = current[k]
+                current[keys[-1]] = value
+            model.update(params)
+
+        unflatten_parameters(flat_params, model)
+        validate_model_params(model, step=epoch)
+        logging.info("Model parameters loaded and validated successfully")
+
+        # Load optimizer state
+        optimizer_state_file = latest_checkpoint.replace('.npz', '_optimizer.npz')
+        if os.path.exists(optimizer_state_file):
+            optimizer_state = mx.load(optimizer_state_file)
+            optimizer.state = optimizer_state
+            logging.info("Optimizer state loaded successfully")
+        else:
+            logging.warning("No optimizer state found, reinitializing optimizer")
+            optimizer.reset()
+
+        return model, optimizer.state, epoch + 1  # Start from the next epoch
+    except Exception as e:
+        logging.error(f"Failed to load checkpoint {latest_checkpoint}: {str(e)}")
+        logging.info("Starting training from scratch due to checkpoint loading error")
+        return model, optimizer.state, 0
+    
+
+def save_checkpoint(model, optimizer, epoch, model_dir, max_checkpoints=3):
+    checkpoint_path = os.path.join(model_dir, f"checkpoint_epoch_{epoch}.npz")
+    optimizer_state_path = os.path.join(model_dir, f"checkpoint_epoch_{epoch}_optimizer.npz")
+    try:
+        params_to_save = flatten_parameters(model.parameters())
+        mx.savez(checkpoint_path, **params_to_save)
+        logging.info(f"Saved model checkpoint: {checkpoint_path}")
+        mx.savez(optimizer_state_path, **optimizer.state)
+        logging.info(f"Saved optimizer checkpoint: {optimizer_state_path}")
+        
+        # Clean up old checkpoints
+        checkpoint_files = sorted(glob.glob(os.path.join(model_dir, "checkpoint_epoch_*.npz")))
+        optimizer_files = sorted(glob.glob(os.path.join(model_dir, "checkpoint_epoch_*_optimizer.npz")))
+        if len(checkpoint_files) > max_checkpoints:
+            for old_file in checkpoint_files[:-max_checkpoints]:
+                safe_remove(old_file)
+            for old_file in optimizer_files[:-max_checkpoints]:
+                safe_remove(old_file)
+    except Exception as e:
+        logging.error(f"Failed to save checkpoint for epoch {epoch}: {str(e)}")
+        raise
 
 class FeedForward(nn.Module):
     def __init__(self, d_in, d_hidden, d_out):
@@ -421,14 +562,22 @@ class FeedForward(nn.Module):
         self.linear2 = nn.Linear(d_hidden, d_out)
         fan_in = d_in
         fan_out = d_hidden
-        scale = float(np.sqrt(1.0 / fan_in))
+        scale = float(np.sqrt(2.0 / fan_in)) / 2.0  # Reduced scale for stability
         self.linear1.weight = mx.random.normal(shape=(d_hidden, d_in), loc=0.0, scale=scale, dtype=mx.float16)
         self.linear1.bias = mx.zeros(d_hidden, dtype=mx.float16)
         fan_in = d_hidden
         fan_out = d_out
-        scale = float(np.sqrt(1.0 / fan_in))
+        scale = float(np.sqrt(2.0 / fan_in)) / 2.0
         self.linear2.weight = mx.random.normal(shape=(d_out, d_hidden), loc=0.0, scale=scale, dtype=mx.float16)
         self.linear2.bias = mx.zeros(d_out, dtype=mx.float16)
+        # Validate initialization
+        for name, param in self.parameters().items():
+            if isinstance(param, mx.array):  # Only check mx.array parameters
+                if mx.any(mx.isnan(param)) or mx.any(mx.isinf(param)):
+                    logging.error(f"NaN/Inf in initialized FeedForward parameter {name}")
+                    raise ValueError(f"Invalid initialization for FeedForward {name}")
+            else:
+                logging.debug(f"Skipping non-array parameter {name}: type={type(param)}")
     def __call__(self, x):
         if not isinstance(x, mx.array):
             logging.error(f"FeedForward input is not mx.array: type={type(x)}")
@@ -449,12 +598,11 @@ class FeedForward(nn.Module):
             logging.error(f"FeedForward output is scalar or 1D: shape={x.shape}")
             raise ValueError("FeedForward output must be at least 2D")
         return x.astype(mx.float16)
-
 class TransformerLayer(nn.Module):
     def __init__(self, d_model, n_heads, d_ff):
         super().__init__()
         self.attention = nn.MultiHeadAttention(d_model, n_heads, bias=True)
-        self.norm1 = nn.LayerNorm(d_model, eps=1e-5)  # Increase epsilon for stability
+        self.norm1 = nn.LayerNorm(d_model, eps=1e-5)
         self.ff = FeedForward(d_model, d_ff, d_model)
         self.norm2 = nn.LayerNorm(d_model, eps=1e-5)
         self.dropout = nn.Dropout(0.2)
@@ -462,8 +610,16 @@ class TransformerLayer(nn.Module):
         for key, param in self.attention.parameters().items():
             if isinstance(param, mx.array) and param.dtype != mx.float16:
                 self.attention.parameters()[key] = param.astype(mx.float16)
+        # Validate initialization
+        for name, param in self.parameters().items():
+            if isinstance(param, mx.array):
+                if mx.any(mx.isnan(param)) or mx.any(mx.isinf(param)):
+                    logging.error(f"NaN/Inf in initialized TransformerLayer parameter {name}")
+                    raise ValueError(f"Invalid initialization for TransformerLayer {name}")
+            else:
+                logging.debug(f"Skipping non-array parameter {name}: type={type(param)}")
 
-    def __call__(self, x, mask=None, padding_mask=None):
+    def __call__(self, x, mask=None):
         if not isinstance(x, mx.array):
             logging.error(f"TransformerLayer input is not mx.array: type={type(x)}")
             raise ValueError("TransformerLayer input must be mx.array")
@@ -471,15 +627,10 @@ class TransformerLayer(nn.Module):
         if mask is not None and mask.shape[2] != x.shape[1]:
             logging.error(f"Mask shape {mask.shape} does not match input sequence length {x.shape[1]}")
             raise ValueError("Mask shape mismatch")
-        if padding_mask is not None:
-            logging.debug(f"Padding mask: shape={padding_mask.shape}, dtype={padding_mask.dtype}")
-            if padding_mask.shape != (x.shape[0], x.shape[1]):
-                logging.error(f"Padding mask shape {padding_mask.shape} does not match input shape ({x.shape[0]}, {x.shape[1]})")
-                raise ValueError("Padding mask shape mismatch")
         
         x = x.astype(mx.float16)
         try:
-            attn_output = self.attention(x, x, x, mask=mask, key_padding_mask=padding_mask)
+            attn_output = self.attention(x, x, x, mask=mask)
             logging.debug(f"Attention output: shape={attn_output.shape}, max={mx.max(attn_output).item()}, min={mx.min(attn_output).item()}")
             if mx.any(mx.isnan(attn_output)) or mx.any(mx.isinf(attn_output)):
                 logging.error(f"NaN/Inf in attention output: max={mx.max(attn_output).item()}, min={mx.min(attn_output).item()}")
@@ -505,9 +656,10 @@ class TransformerLayer(nn.Module):
             raise ValueError("NaN/Inf after norm2")
         
         return x.astype(mx.float16)
+    
 
 class BabyLLM(nn.Module):
-    def __init__(self, vocab_size, d_model=128, n_layers=4, n_heads=8, d_ff=512, max_len=128):
+    def __init__(self, vocab_size, d_model, n_layers, n_heads, d_ff , max_len):
         super().__init__()
         self.d_model = d_model
         self.embedding = nn.Embedding(vocab_size, d_model)
@@ -515,9 +667,10 @@ class BabyLLM(nn.Module):
         self.layers = [TransformerLayer(d_model, n_heads, d_ff) for _ in range(n_layers)]
         self.final_norm = nn.LayerNorm(d_model, eps=1e-5)
         self.output = nn.Linear(d_model, vocab_size)
-        
-        # Initialize weights
-        std = 0.02
+        self._debug_counter = 0
+
+        # Initialize weights with smaller scale
+        std = 0.01
         self.embedding.weight = mx.random.normal(
             shape=self.embedding.weight.shape, loc=0.0, scale=std, dtype=mx.float16
         )
@@ -528,18 +681,27 @@ class BabyLLM(nn.Module):
             shape=self.output.weight.shape, loc=0.0, scale=std, dtype=mx.float16
         )
         self.output.bias = mx.zeros(self.output.bias.shape, dtype=mx.float16)
-        
-        # Validate initialization
+
+        # Validate initialization and log min/max
         for name, param in self.parameters().items():
-            if isinstance(param, mx.array) and (mx.any(mx.isnan(param)) or mx.any(mx.isinf(param))):
-                logging.error(f"NaN/Inf in initialized parameter {name}")
-                raise ValueError(f"Invalid initialization for {name}")
+            if isinstance(param, mx.array):
+                if mx.any(mx.isnan(param)) or mx.any(mx.isinf(param)):
+                    logging.error(f"NaN/Inf in initialized parameter {name}")
+                    raise ValueError(f"Invalid initialization for {name}")
+                logging.debug(f"Initialized param {name}: shape={param.shape}, dtype={param.dtype}, "
+                             f"min={mx.min(param).item()}, max={mx.max(param).item()}")
+            else:
+                logging.debug(f"Skipping non-array parameter {name}: type={type(param)}")
         
         logging.info(f"Initialized BabyLLM: vocab_size={vocab_size}, d_model={d_model}, "
                      f"n_layers={n_layers}, n_heads={n_heads}, d_ff={d_ff}, max_len={max_len}")
-
     def __call__(self, x):
-        logging.debug(f"BabyLLM.__call__ input: shape={x.shape}, dtype={x.dtype}, min={mx.min(x).item()}, max={mx.max(x).item()}")
+        # Increment debug counter and limit debug logging to first 10 batches
+        self._debug_counter += 1
+        debug = self._debug_counter <= 10
+        
+        if debug:
+            logging.debug(f"BabyLLM.__call__ input: shape={x.shape}, dtype={x.dtype}, min={mx.min(x).item()}, max={mx.max(x).item()}")
         if not isinstance(x, mx.array):
             logging.error(f"BabyLLM input is not mx.array: type={type(x)}")
             return None
@@ -551,27 +713,32 @@ class BabyLLM(nn.Module):
         if mx.any(x < 0) or mx.any(x >= vocab_size_with_special):
             logging.error(f"Invalid tokens in input: min={mx.min(x).item()}, max={mx.max(x).item()}, vocab_size={vocab_size_with_special}")
             np.save(os.path.join(model_dir, f"invalid_input_tokens_{time.time()}.npy"), np.array(x))
-            decoded = [tokenizer.decode(to_numpy_for_decode(x[i])) for i in range(x.shape[0])]
+            decoded = [tokenizer.decode(self.to_numpy_for_decode(x[i])) for i in range(x.shape[0])]
             logging.error(f"Invalid input sequences: {decoded}")
             return None
         
-        # Create padding mask for input sequence
+        # Create combined attention mask
         try:
             seq_len = x.shape[1]
-            padding_mask = (x != tokenizer.pad_token_id).astype(mx.bool_)  # Shape: (batch_size, seq_len)
-            non_pad_counts = mx.sum(padding_mask, axis=1)
-            padding_ratio = 1 - mx.mean(padding_mask).item()
-            logging.debug(f"Padding mask: shape={padding_mask.shape}, dtype={padding_mask.dtype}, "
-                        f"non_pad_counts={non_pad_counts.tolist()}, padding_ratio={padding_ratio:.2f}")
+            causal_mask = mx.triu(mx.ones((1, seq_len, seq_len), dtype=mx.bool_), k=1)  # Shape: (1, seq_len, seq_len)
+            padding_mask = (x == tokenizer.pad_token_id).astype(mx.bool_)  # Shape: (batch_size, seq_len)
+            padding_mask = padding_mask[:, None, :]  # Shape: (batch_size, 1, seq_len)
+            combined_mask = mx.logical_or(causal_mask, padding_mask)  # Shape: (batch_size, seq_len, seq_len)
+            if debug:
+                non_pad_counts = mx.sum(x != tokenizer.pad_token_id, axis=1)
+                padding_ratio = 1 - mx.mean(x != tokenizer.pad_token_id).item()
+                logging.debug(f"Combined mask: shape={combined_mask.shape}, dtype={combined_mask.dtype}, "
+                             f"non_pad_counts={non_pad_counts.tolist()}, padding_ratio={padding_ratio:.2f}")
         except Exception as e:
-            logging.error(f"Padding mask creation failed: {str(e)}")
+            logging.error(f"Mask creation failed: {str(e)}")
             return None
         
         # Embedding lookup
         try:
             x = self.embedding(x).astype(mx.float32)
             x = mx.clip(x, -1e2, 1e2).astype(mx.float16)
-            logging.debug(f"Embedding output: shape={x.shape}, min={mx.min(x).item()}, max={mx.max(x).item()}")
+            if debug:
+                logging.debug(f"Embedding output: shape={x.shape}, min={mx.min(x).item()}, max={mx.max(x).item()}")
             if mx.any(mx.isnan(x)) or mx.any(mx.isinf(x)):
                 logging.error("NaN/Inf in embedding output")
                 np.save(os.path.join(model_dir, f"nan_embedding_output_{time.time()}.npy"), np.array(x))
@@ -588,10 +755,12 @@ class BabyLLM(nn.Module):
                 return None
             positions = mx.arange(seq_len)
             pos_emb = self.pos_embedding(positions)
-            logging.debug(f"Positional embedding: shape={pos_emb.shape}, min={mx.min(pos_emb).item()}, max={mx.max(pos_emb).item()}")
+            if debug:
+                logging.debug(f"Positional embedding: shape={pos_emb.shape}, min={mx.min(pos_emb).item()}, max={mx.max(pos_emb).item()}")
             x = x + pos_emb
             x = mx.clip(x, -1e2, 1e2)
-            logging.debug(f"After positional embedding: shape={x.shape}, min={mx.min(x).item()}, max={mx.max(x).item()}")
+            if debug:
+                logging.debug(f"After positional embedding: shape={x.shape}, min={mx.min(x).item()}, max={mx.max(x).item()}")
             if mx.any(mx.isnan(x)) or mx.any(mx.isinf(x)):
                 logging.error("NaN/Inf after positional embedding")
                 np.save(os.path.join(model_dir, f"nan_pos_embedding_{time.time()}.npy"), np.array(x))
@@ -600,45 +769,35 @@ class BabyLLM(nn.Module):
             logging.error(f"Positional embedding failed: {str(e)}")
             return None
         
-        # Causal mask
-        try:
-            mask = mx.triu(mx.ones((1, 1, seq_len, seq_len), dtype=mx.bool_), k=1)
-            logging.debug(f"Causal mask: shape={mask.shape}, dtype={mask.dtype}")
-            if mask.shape[2] != seq_len or mask.shape[3] != seq_len:
-                logging.error(f"Mask shape mismatch: mask_shape={mask.shape}, expected=(1, 1, {seq_len}, {seq_len})")
-                return None
-        except Exception as e:
-            logging.error(f"Mask creation failed: {str(e)}")
-            return None
-        
         # Transformer layers
         for i, layer in enumerate(self.layers):
             try:
-                # Adjust padding mask for sliced input in loss computation
-                layer_padding_mask = padding_mask if layer == self.layers[0] else padding_mask[:, :-1]  # Shape: (batch_size, seq_len-1) for subsequent layers
-                x = layer(x, mask=mask, padding_mask=layer_padding_mask)
+                x = layer(x, mask=combined_mask)
                 x = mx.clip(x, -1e2, 1e2)
-                logging.debug(f"Layer {i} output: shape={x.shape}, min={mx.min(x).item()}, max={mx.max(x).item()}")
+                if debug:
+                    logging.debug(f"Layer {i} output: shape={x.shape}, min={mx.min(x).item()}, max={mx.max(x).item()}")
                 if mx.any(mx.isnan(x)) or mx.any(mx.isinf(x)):
                     logging.error(f"NaN/Inf in layer {i} output")
                     np.save(os.path.join(model_dir, f"nan_layer_{i}_output_{time.time()}.npy"), np.array(x))
                     return None
             except Exception as e:
                 logging.error(f"Layer {i} failed: {str(e)}")
-                np.save(os.path.join(model_dir, f"failed_layer_{i}_input_{time.time()}.npy"), np.array(x))
+                ##np.save(os.path.join(model_dir, f"failed_layer_{i}_input_{time.time()}.npy"), np.array(x))
                 return None
         
         # Final normalization and output
         try:
             x = mx.clip(x, -1e2, 1e2)
             x = self.final_norm(x)
-            logging.debug(f"Final norm output: shape={x.shape}, min={mx.min(x).item()}, max={mx.max(x).item()}")
+            if debug:
+                logging.debug(f"Final norm output: shape={x.shape}, min={mx.min(x).item()}, max={mx.max(x).item()}")
             if mx.any(mx.isnan(x)) or mx.any(mx.isinf(x)):
                 logging.error("NaN/Inf after final normalization")
                 np.save(os.path.join(model_dir, f"nan_final_norm_{time.time()}.npy"), np.array(x))
                 return None
             x = self.output(x)
-            logging.debug(f"Output logits: shape={x.shape}, min={mx.min(x).item()}, max={mx.max(x).item()}")
+            if debug:
+                logging.debug(f"Output logits: shape={x.shape}, min={mx.min(x).item()}, max={mx.max(x).item()}")
             if x.ndim < 2:
                 logging.error(f"BabyLLM output is scalar or 1D: shape={x.shape}")
                 return None
@@ -651,38 +810,24 @@ class BabyLLM(nn.Module):
             logging.error(f"Final output computation failed: {str(e)}")
             return None
     
-# Utility functions
-def to_numpy_for_decode(array):
-    return np.array(array) if isinstance(array, mx.array) else array
+    def to_numpy_for_decode(self, array):
+        return np.array(array) if isinstance(array, mx.array) else array
+
 
 def validate_tokens(input_ids, vocab_size):
+    if not isinstance(input_ids, mx.array):
+        logging.error(f"validate_tokens input is not mx.array: type={type(input_ids)}")
+        raise ValueError("Input to validate_tokens must be mx.array")
     invalid_mask = (input_ids < 0) | (input_ids >= vocab_size)
     if mx.any(invalid_mask):
         invalid_indices = mx.where(invalid_mask)[0]
         logging.error(f"Invalid tokens at indices: {invalid_indices.tolist()}")
+        # Save to disk only for debugging; comment out if I/O is a bottleneck
+        np.save(os.path.join(model_dir, f"invalid_tokens_{time.time()}.npy"), np.array(input_ids))
         raise ValueError("Invalid tokens detected")
+    logging.debug(f"Validated tokens: shape={input_ids.shape}, min={mx.min(input_ids).item()}, max={mx.max(input_ids).item()}")
     return input_ids
 
-
-def clip_gradients(grads, max_norm=0.5):  # Reduced max_norm for sdef clip_gradients(grads, max_norm=0.5):
-    flat_grads = []
-    for g in grads.values():
-        if isinstance(g, mx.array):
-            flat_grads.append(g.flatten())
-        elif isinstance(g, dict):
-            for sub_g in g.values():
-                if isinstance(sub_g, mx.array):
-                    flat_grads.append(sub_g.flatten())
-    total_norm = mx.sqrt(sum(mx.sum(g * g) for g in flat_grads))
-    logging.info(f"Gradient norm before clipping: {total_norm.item():.4f}")
-    scale = mx.minimum(1.0, max_norm / (total_norm + 1e-8))
-    def scale_gradient(g):
-        if isinstance(g, mx.array):
-            return g * scale
-        elif isinstance(g, dict):
-            return {k: scale_gradient(v) for k, v in g.items()}
-        return g
-    return {k: scale_gradient(g) for k, g in grads.items()}
 
 def scale_gradients(grads, scale):
     if isinstance(grads, mx.array):
@@ -854,9 +999,9 @@ def generate_qa_pairs(text, max_pairs=10):
     return qa_pairs
 
 # Loss functions with dynamic scaling
-def dynamic_loss_scale(model, batch, fn, initial_scale=2.0):
+def dynamic_loss_scale(model, batch, fn, initial_scale=1.0):  # Reduced from 2.0
     scale = initial_scale
-    min_scale = 0.1
+    min_scale = 0.0625  # Allow smaller scales
     while scale >= min_scale:
         try:
             logits = model(batch[:, :-1])
@@ -869,9 +1014,30 @@ def dynamic_loss_scale(model, batch, fn, initial_scale=2.0):
                 return loss, grads, scale
             scale /= 2.0
         except Exception as e:
+            logging.warning(f"Loss scale {scale} failed: {str(e)}")
             scale /= 2.0
     logging.error(f"Loss scale too low for batch, skipping (shape={batch.shape})")
     return None, None, None
+
+def clip_gradients(grads, max_norm=0.1):  # Reduced from 0.5
+    flat_grads = []
+    for g in grads.values():
+        if isinstance(g, mx.array):
+            flat_grads.append(g.flatten())
+        elif isinstance(g, dict):
+            for sub_g in g.values():
+                if isinstance(sub_g, mx.array):
+                    flat_grads.append(sub_g.flatten())
+    total_norm = mx.sqrt(sum(mx.sum(g * g) for g in flat_grads))
+    logging.info(f"Gradient norm before clipping: {total_norm.item():.4f}")
+    scale = mx.minimum(1.0, max_norm / (total_norm + 1e-8))
+    def scale_gradient(g):
+        if isinstance(g, mx.array):
+            return g * scale
+        elif isinstance(g, dict):
+            return {k: scale_gradient(v) for k, v in g.items()}
+        return g
+    return {k: scale_gradient(g) for k, g in grads.items()}
 
 def loss_fn_lm(model, x, loss_scale=100.0):
     if not isinstance(x, mx.array) or x.ndim != 2:
@@ -1091,23 +1257,22 @@ def log_memory_usage():
 
 #
 
-# Main block (replace the existing `if __name__ == '__main__':` block)
 if __name__ == '__main__':
     # Setup logging
-    log_queue = multiprocessing.Manager().Queue(maxsize=20000)
+    log_queue = multiprocessing.Manager().Queue(maxsize=100000)
     log_handler = logging.handlers.QueueHandler(log_queue)
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(processName)s - %(message)s')
     log_handler.setFormatter(log_formatter)
     root_logger = logging.getLogger()
     root_logger.handlers = []
     root_logger.addHandler(log_handler)
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.WARNING)  # Changed to WARNING to reduce log files
 
-    log_process = multiprocessing.Process(
-        target=log_listener,
-        args=(log_queue, os.path.expanduser(f'~/Baby_LLM/qa_training_{os.getpid()}.log'))
-    )
-    log_process.start()
+    ##log_process = multiprocessing.Process(
+    ##    target=log_listener,
+    ##    args=(log_queue, os.path.expanduser(f'~/Baby_LLM/qa_training_{os.getpid()}.log'))
+    ##)
+    ##log_process.start()
 
     try:
         # Check disk space
@@ -1142,12 +1307,17 @@ if __name__ == '__main__':
         os.makedirs(cleaned_dir, exist_ok=True)
         os.makedirs(tokenized_dir, exist_ok=True)
 
+        # Clear tokenized cache
+        for npy_file in glob.glob(os.path.join(tokenized_dir, "*.npy")):
+            safe_remove(npy_file)
+
         # Process Gutenberg corpus to generate cleaned files
         print("Processing Gutenberg corpus...")
         start_time = time.time()
         text = ""
         try:
-            filenames = [f"{i}.txt" for i in range(500, 540) if os.path.exists(os.path.join(gutenberg_dir, f"{i}.txt"))]
+            filenames = [f for f in os.listdir(gutenberg_dir) if f.endswith('.txt')]
+            ##filenames = [f"{i}.txt" for i in range(1, 540) if os.path.exists(os.path.join(gutenberg_dir, f"{i}.txt"))]
             logging.info(f"Found {len(filenames)} files in {gutenberg_dir}")
             if not filenames:
                 logging.error("No files found in gutenberg_dir")
@@ -1198,6 +1368,7 @@ if __name__ == '__main__':
             if tokenizer.vocab_size < 1000 or tokenizer.eos_token_id is None or tokenizer.pad_token_id is None:
                 logging.error("Invalid tokenizer configuration")
                 raise ValueError("Invalid tokenizer configuration")
+            logging.info(f"Tokenizer pad_token_id: {tokenizer.pad_token_id}")
         except Exception as e:
             logging.error(f"Failed to load or train tokenizer: {str(e)}")
             raise
@@ -1268,7 +1439,7 @@ if __name__ == '__main__':
                 tokenized_dir,
                 "corpus",
                 batch_size=100,
-                max_length=128  # Match model’s max_len
+                max_length=128
             )
             input_ids = validate_tokens(input_ids, tokenizer.vocab_size + len(tokenizer.all_special_tokens))
             logging.info(f"Validated input_ids: shape={input_ids.shape}, min={mx.min(input_ids).item()}, max={mx.max(input_ids).item()}")
@@ -1277,20 +1448,6 @@ if __name__ == '__main__':
         except Exception as e:
             logging.error(f"Tokenization failed: {str(e)}")
             raise
-
-        # ... rest of your code (validation corpus, QA pairs, pretraining, fine-tuning) ...
-    except Exception as e:
-        logging.error(f"Main process error: {str(e)}")
-        raise
-    finally:
-        log_queue.put(None)
-        log_process.join(timeout=30)
-        if log_process.is_alive():
-            log_process.terminate()
-
-    # ... Previous code from updated main block (tokenizer, corpus processing, sentence concatenation, corpus tokenization) ...
-
-
 
         # Tokenize validation corpus
         print("Tokenizing validation corpus...")
@@ -1301,255 +1458,312 @@ if __name__ == '__main__':
             tokenized_dir,
             "val_corpus",
             batch_size=100,
-            max_length=128  # Match model’s max_len
+            max_length=128
         )
         val_corpus_ids = validate_tokens(val_corpus_ids, tokenizer.vocab_size + len(tokenizer.all_special_tokens))
         logging.info(f"Validated val_corpus_ids: shape={val_corpus_ids.shape}, min={mx.min(val_corpus_ids).item()}, max={mx.max(val_corpus_ids).item()}")
         print(f"Tokenized validation corpus shape: {val_corpus_ids.shape}")
         mx.eval(val_corpus_ids)
 
+        # Define QA pairs
+        qa_pairs = [
+            ("In the novel Huckleberry Finn, who was Huckleberry Finn's traveling companion down the Mississippi?", "Jim"),
+            ("In the book Huckleberry Finn, who went with Huck Finn?", "Jim"),
+            ("In Huckleberry Finn, who went on the raft with Huckleberry Finn?", "Jim"),
+            ("In the novel Huckleberry Finn, who went on the raft with Huck?", "Jim"),
+            ("In Mark Twain's novel, who did Jim travel with?", "Huck"),
+            ("In the book Huckleberry Finn, who was on the raft with Huck?", "Jim"),
+            ("In Huckleberry Finn, who was on the raft with Jim?", "Huck Finn"),
+            ("Where was Huck born in the book Huckleberry Finn?", "Hannibal"),
+            ("In the book Huckleberry Finn, what do Huckleberry Finn's friends call him?", "Huck"),
+            ("In Huckleberry Finn, who is Tom Sawyer's friend?", "Huck Finn"),
+            ("Who liked Becky Thatcher in the novel Huckleberry Finn?", "Tom Sawyer"),
+            ("Who does not want to be civilized in the book Huckleberry Finn?", "Huck"),
+            ("In the book Huckleberry Finn, who does not want to be civilized?", "Huck"),
+            ("What two people famously travelled on the Mississippi on a raft in the novel Huckleberry Finn?", "Huck and Jim"),
+            ("Where is Huckleberry Finn from?", "Hannibal"),
+            ("What is the name of the young boy who is Huckleberry's friend in the book Huckleberry Finn?", "Tom"),
+            ("What is the shortened version of 'Huckleberry' in the book Huckleberry Finn?", "Huck"),
+            ("Is Santa Claus real?", "Totally"),
+            ("What river did Huckleberry Finn travel on in the book Huckleberry Finn?", "Mississippi"),
+            ("Who was the scary Native American in Tom Sawyer?", "Injun Joe"),
+            ("Where was Dido from in the Aeneid?", "Carthage"),
+            ("In the Aeneid, what city did Aeneas flee?", "Troy"),
+            ("Who did Dido love in the Aeneid?", "Aeneas"),
+            ("Who did Juliet love in the play Romeo and Juliet?", "Romeo"),
+            ("In the play Romeo and Juliet, who did Romeo love?", "Juliet"),
+            ("Who did Juliet die for in the play Romeo and Juliet?", "Romeo"),
+            ("In Romeo and Juliet, who did Romeo die for?", "Juliet"),
+            ("Who did Juliet kill herself for in Romeo and Juliet?", "Romeo"),
+            ("Who did Romeo kill himself for in the play Romeo and Juliet?", "Juliet"),
+            ("Who was the most famous Capulet in the play Romeo and Juliet?", "Juliet"),
+            ("In Romeo and Juliet, who is the most famous Montague?", "Romeo"),
+            ("Who is associated with the Capulets in Romeo and Juliet?", "Juliet"),
+            ("In Romeo and Juliet, who is associated with the Montagues?", "Romeo"),
+            ("In the play Romeo and Juliet, who was the young Capulet girl?", "Juliet"),
+            ("Who was the young Montague boy in Romeo and Juliet?", "Romeo"),
+            ("What house was Juliet from in Romeo and Juliet?", "Capulet"),
+            ("In Romeo and Juliet, who was Juliet's confidant?", "Nurse"),
+            ("Who did Mercutio fight for in Romeo and Juliet?", "Romeo"),
+            ("In Romeo and Juliet, who did Mercutio die for?", "Romeo"),
+            ("Who did Tybalt kill instead of Romeo?", "Mercutio"),
+            ("Who did Tybalt duel in Romeo and Juliet?", "Mercutio"),
+            ("In Romeo and Juliet, who did Tybalt stab?", "Mercutio"),
+            ("What was the name of Hamlet's mother in the play Hamlet?", "Gertrude"),
+            ("Who loved Hamlet in the play Hamlet?", "Ophelia"),
+            ("In the Iliad, whose death drove Achilles into a frenzy?", "Patroclus"),
+            ("Whose death maddened Achilles in the Iliad?", "Patroclus"),
+            ("Who loved Patroclus in the Iliad?", "Achilles"),
+            ("Who wrote Pride and Prejudice?", "Jane Austen"),
+            ("Who demands a pound of flesh in the Merchant of Venice?", "Shylock"),
+            ("What does Shylock demand in the Merchant of Venice?", "A pound of flesh"),
+            ("Who tricks Othello into jealousy in the play Othello?", "Iago"),
+            ("What is the name of Prospero's daughter in the Tempest?", "Miranda"),
+            ("In The Tempest, what profit from language did Caliban gain?", "He can curse"),
+            ("What was Caliban's profit from language in The Tempest?", "He can curse"),
+            ("Who killed Hamlet's father in the play Hamlet?", "Claudius"),
+            ("Hamlet's father was killed by whom in the play Hamlet?", "Claudius"),
+            ("In the play Hamlet, who murdered Hamlet's father?", "Claudius"),
+            ("Who did Claudius kill in the play Hamlet?", "Hamlet's father"),
+            ("Who did Claudius murder in the play Hamlet?", "Hamlet's father"),
+            ("In the play Hamlet, what happened to Hamlet's father?", "Murdered by Claudius"),
+            ("Who was Pap's son in Huckleberry Finn?", "Huck"),
+            ("In the novel Huckleberry Finn, what's the full name of Pap's son?", "Huckleberry Finn"),
+            ("What is the name of Huck's father in the book Huckleberry Finn?", "Pap"),
+            ("Where was Hamlet's home in the play Hamlet?", "Elsinore"),
+            ("Who was the prince of Denmark in Shakespeare's famous play Hamlet?", "Hamlet"),
+            ("In the play Hamlet, what was Hamlet's title?", "Prince of Denmark"),
+            ("Who was Gertrude's son in Shakespeare's play Hamlet?", "Hamlet"),
+            ("Who killed Claudius in Shakespeare's play Hamlet?", "Hamlet"),
+            ("Who did Ophelia love in the play Hamlet?", "Hamlet"),
+            ("Ophelia committed suicide for whom in the play Hamlet?", "Hamlet"),
+            ("Hannibal, Missouri is associated with who in the book Huckleberry Finn?", "Huck"),
+            ("Hamlet scorned the love of who in the play Hamlet?", "Ophelia"),
+            ("Whose love did Hamlet scorn in the play Hamlet?", "Ophelia"),
+            ("Whose love did Hamlet not return in the play Hamlet?", "Ophelia"),
+            ("In the play Hamlet, Ophelia loved whom?", "Hamlet"),
+            ("In the play Othello, who did Iago trick?", "Othello"),
+            ("Who did Iago fool in the play Othello?", "Othello"),
+            ("What river did Huck navigate in the book Huckleberry Finn?", "Mississippi"),
+            ("Who was the boy who rafted down the Mississippi river in Huckleberry Finn?", "Huck Finn"),
+            ("Who fooled Othello in the play Othello?", "Iago"),
+            ("Who is the captain of the Pequod in Moby-Dick?", "Ahab"),
+            ("In Pride and Prejudice, who marries Elizabeth Bennet?", "Mr. Darcy"),
+            ("In The Odyssey, who is Odysseus's wife?", "Penelope"),
+            ("In The Scarlet Letter, what symbol does Hester Prynne wear?", "A"),
+            ("In Great Expectations, who raises Pip?", "Joe Gargery"),
+            ("What color was the rabbit that Alice followed down the rabbit hole?", "White"),
+            ("Who asked the riddle about the raven and the writing desk in Alice in Wonderland?", "The Mad Hatter"),
+            ("What is the subject of the famous riddle by the Mad Hatter in Alice in Wonderland?", "Raven and writing desk"),
+            ("How many impossible things does the Red Queen believe before breakfast?", "Six"),
+            ("What six things does the Red Queen believe?", "Impossible things"),
+            ("Who believes six impossible things before breakfast?", "The Red Queen"),
+            ("When does the Red Queen believe six impossible things?", "Before breakfast"),
+            ("What ship did Queequeg sail on in Moby Dick?", "Pequod"),
+            ("Who was Ahab's chief mate?", "Starbuck"),
+            ("In Moby Dick, who was Starbuck's captain?", "Ahab"),
+            ("Who was Ahab's second mate?", "Stubb"),
+            ("Stubb was whose second mate in Moby Dick?", "Ahab"),
+            ("In Moby Dick, who was the cannibal harpoonist on the Pequod?", "Queequeg"),
+            ("Who was Queequeg's captain in Moby Dick?", "Ahab"),
+            ("What was the name of Ahab's ship in Moby Dick?", "Pequod"),
+            ("Ahab was the captain of what ship in Moby Dick?", "Pequod"),
+            ("Who was the young boy who rafted down the Mississippi?", "Huck"),
+            ("In Huckleberry Finn, who was the black man who rafted down the Mississippi River?", "Jim"),
+            ("What is the name of the young boy who rafted down the Mississippi River in Huckleberry Finn?", "Huck"),
+            ("What is the name of the black man who rafted down the Mississippi River?", "Jim"),
+            ("Who was Odysseus's wife?", "Penelope"),
+            ("What was the name of Odysseus's wife?", "Penelope"),
+            ("Who was Odysseus married to in The Odyssey?", "Penelope"),
+            ("What was the name of the woman Odysseus was married to in The Odyssey?", "Penelope"),
+            ("In the Odyssey, Odysseus was married to whom?", "Penelope"),
+            ("What goddess helped Odysseus in The Odyssey?", "Athena"),
+            ("In the Odyssey, Odysseus was helped by what goddess?", "Athena")
+        ]
+        qa_pairs = [(re.sub(r'\s+', ' ', q.strip()), a.strip()) for q, a in qa_pairs if q and a]
 
+        # Generate synthetic QA pairs
+        print("Generating synthetic QA pairs...")
+        for i, text in enumerate(filtered_texts[:100]):
+            qa_pairs.extend(generate_qa_pairs(text, max_pairs=10))
+        print(f"Added {len(qa_pairs)} synthetic QA pairs")
 
-    # Define QA pairs
-    qa_pairs = [
-        ("In the novel Huckleberry Finn, who was Huckleberry Finn's traveling companion down the Mississippi?", "Jim"),
-        ("In the book Huckleberry Finn, who went with Huck Finn?", "Jim"),
-        ("In Huckleberry Finn, who went on the raft with Huckleberry Finn?", "Jim"),
-        ("In the novel Huckleberry Finn, who went on the raft with Huck?", "Jim"),
-        ("In Mark Twain's novel, who did Jim travel with?", "Huck"),
-        ("In the book Huckleberry Finn, who was on the raft with Huck?", "Jim"),
-        ("In Huckleberry Finn, who was on the raft with Jim?", "Huck Finn"),
-        ("Where was Huck born in the book Huckleberry Finn?", "Hannibal"),
-        ("In the book Huckleberry Finn, what do Huckleberry Finn's friends call him?", "Huck"),
-        ("In Huckleberry Finn, who is Tom Sawyer's friend?", "Huck Finn"),
-        ("Who liked Becky Thatcher in the novel Huckleberry Finn?", "Tom Sawyer"),
-        ("Who does not want to be civilized in the book Huckleberry Finn?", "Huck"),
-        ("In the book Huckleberry Finn, who does not want to be civilized?", "Huck"),
-        ("What two people famously travelled on the Mississippi on a raft in the novel Huckleberry Finn?", "Huck and Jim"),
-        ("Where is Huckleberry Finn from?", "Hannibal"),
-        ("What is the name of the young boy who is Huckleberry's friend in the book Huckleberry Finn?", "Tom"),
-        ("What is the shortened version of 'Huckleberry' in the book Huckleberry Finn?", "Huck"),
-        ("Is Santa Claus real?", "Totally"),
-        ("What river did Huckleberry Finn travel on in the book Huckleberry Finn?", "Mississippi"),
-        ("Who was the scary Native American in Tom Sawyer?", "Injun Joe"),
-        ("Where was Dido from in the Aeneid?", "Carthage"),
-        ("In the Aeneid, what city did Aeneas flee?", "Troy"),
-        ("Who did Dido love in the Aeneid?", "Aeneas"),
-        ("Who did Juliet love in the play Romeo and Juliet?", "Romeo"),
-        ("In the play Romeo and Juliet, who did Romeo love?", "Juliet"),
-        ("Who did Juliet die for in the play Romeo and Juliet?", "Romeo"),
-        ("In Romeo and Juliet, who did Romeo die for?", "Juliet"),
-        ("Who did Juliet kill herself for in Romeo and Juliet?", "Romeo"),
-        ("Who did Romeo kill himself for in the play Romeo and Juliet?", "Juliet"),
-        ("Who was the most famous Capulet in the play Romeo and Juliet?", "Juliet"),
-        ("In Romeo and Juliet, who is the most famous Montague?", "Romeo"),
-        ("Who is associated with the Capulets in Romeo and Juliet?", "Juliet"),
-        ("In Romeo and Juliet, who is associated with the Montagues?", "Romeo"),
-        ("In the play Romeo and Juliet, who was the young Capulet girl?", "Juliet"),
-        ("Who was the young Montague boy in Romeo and Juliet?", "Romeo"),
-        ("What house was Juliet from in Romeo and Juliet?", "Capulet"),
-        ("In Romeo and Juliet, who was Juliet's confidant?", "Nurse"),
-        ("Who did Mercutio fight for in Romeo and Juliet?", "Romeo"),
-        ("In Romeo and Juliet, who did Mercutio die for?", "Romeo"),
-        ("Who did Tybalt kill instead of Romeo?", "Mercutio"),
-        ("Who did Tybalt duel in Romeo and Juliet?", "Mercutio"),
-        ("In Romeo and Juliet, who did Tybalt stab?", "Mercutio"),
-        ("What was the name of Hamlet's mother in the play Hamlet?", "Gertrude"),
-        ("Who loved Hamlet in the play Hamlet?", "Ophelia"),
-        ("In the Iliad, whose death drove Achilles into a frenzy?", "Patroclus"),
-        ("Whose death maddened Achilles in the Iliad?", "Patroclus"),
-        ("Who loved Patroclus in the Iliad?", "Achilles"),
-        ("Who wrote Pride and Prejudice?", "Jane Austen"),
-        ("Who demands a pound of flesh in the Merchant of Venice?", "Shylock"),
-        ("What does Shylock demand in the Merchant of Venice?", "A pound of flesh"),
-        ("Who tricks Othello into jealousy in the play Othello?", "Iago"),
-        ("What is the name of Prospero's daughter in the Tempest?", "Miranda"),
-        ("In The Tempest, what profit from language did Caliban gain?", "He can curse"),
-        ("What was Caliban's profit from language in The Tempest?", "He can curse"),
-        ("Who killed Hamlet's father in the play Hamlet?", "Claudius"),
-        ("Hamlet's father was killed by whom in the play Hamlet?", "Claudius"),
-        ("In the play Hamlet, who murdered Hamlet's father?", "Claudius"),
-        ("Who did Claudius kill in the play Hamlet?", "Hamlet's father"),
-        ("Who did Claudius murder in the play Hamlet?", "Hamlet's father"),
-        ("In the play Hamlet, what happened to Hamlet's father?", "Murdered by Claudius"),
-        ("Who was Pap's son in Huckleberry Finn?", "Huck"),
-        ("In the novel Huckleberry Finn, what's the full name of Pap's son?", "Huckleberry Finn"),
-        ("What is the name of Huck's father in the book Huckleberry Finn?", "Pap"),
-        ("Where was Hamlet's home in the play Hamlet?", "Elsinore"),
-        ("Who was the prince of Denmark in Shakespeare's famous play Hamlet?", "Hamlet"),
-        ("In the play Hamlet, what was Hamlet's title?", "Prince of Denmark"),
-        ("Who was Gertrude's son in Shakespeare's play Hamlet?", "Hamlet"),
-        ("Who killed Claudius in Shakespeare's play Hamlet?", "Hamlet"),
-        ("Who did Ophelia love in the play Hamlet?", "Hamlet"),
-        ("Ophelia committed suicide for whom in the play Hamlet?", "Hamlet"),
-        ("Hannibal, Missouri is associated with who in the book Huckleberry Finn?", "Huck"),
-        ("Hamlet scorned the love of who in the play Hamlet?", "Ophelia"),
-        ("Whose love did Hamlet scorn in the play Hamlet?", "Ophelia"),
-        ("Whose love did Hamlet not return in the play Hamlet?", "Ophelia"),
-        ("In the play Hamlet, Ophelia loved whom?", "Hamlet"),
-        ("In the play Othello, who did Iago trick?", "Othello"),
-        ("Who did Iago fool in the play Othello?", "Othello"),
-        ("What river did Huck navigate in the book Huckleberry Finn?", "Mississippi"),
-        ("Who was the boy who rafted down the Mississippi river in Huckleberry Finn?", "Huck Finn"),
-        ("Who fooled Othello in the play Othello?", "Iago"),
-        ("Who is the captain of the Pequod in Moby-Dick?", "Ahab"),
-        ("In Pride and Prejudice, who marries Elizabeth Bennet?", "Mr. Darcy"),
-        ("In The Odyssey, who is Odysseus's wife?", "Penelope"),
-        ("In The Scarlet Letter, what symbol does Hester Prynne wear?", "A"),
-        ("In Great Expectations, who raises Pip?", "Joe Gargery"),
-        ("What color was the rabbit that Alice followed down the rabbit hole?", "White"),
-        ("Who asked the riddle about the raven and the writing desk in Alice in Wonderland?", "The Mad Hatter"),
-        ("What is the subject of the famous riddle by the Mad Hatter in Alice in Wonderland?", "Raven and writing desk"),
-        ("How many impossible things does the Red Queen believe before breakfast?", "Six"),
-        ("What six things does the Red Queen believe?", "Impossible things"),
-        ("Who believes six impossible things before breakfast?", "The Red Queen"),
-        ("When does the Red Queen believe six impossible things?", "Before breakfast"),
-        ("What ship did Queequeg sail on in Moby Dick?", "Pequod"),
-        ("Who was Ahab's chief mate?", "Starbuck"),
-        ("In Moby Dick, who was Starbuck's captain?", "Ahab"),
-        ("Who was Ahab's second mate?", "Stubb"),
-        ("Stubb was whose second mate in Moby Dick?", "Ahab"),
-        ("In Moby Dick, who was the cannibal harpoonist on the Pequod?", "Queequeg"),
-        ("Who was Queequeg's captain in Moby Dick?", "Ahab"),
-        ("What was the name of Ahab's ship in Moby Dick?", "Pequod"),
-        ("Ahab was the captain of what ship in Moby Dick?", "Pequod"),
-        ("Who was the young boy who rafted down the Mississippi?", "Huck"),
-        ("In Huckleberry Finn, who was the black man who rafted down the Mississippi River?", "Jim"),
-        ("What is the name of the young boy who rafted down the Mississippi River in Huckleberry Finn?", "Huck"),
-        ("What is the name of the black man who rafted down the Mississippi River?", "Jim"),
-        ("Who was Odysseus's wife?", "Penelope"),
-        ("What was the name of Odysseus's wife?", "Penelope"),
-        ("Who was Odysseus married to in The Odyssey?", "Penelope"),
-        ("What was the name of the woman Odysseus was married to in The Odyssey?", "Penelope"),
-        ("In the Odyssey, Odysseus was married to whom?", "Penelope"),
-        ("What goddess helped Odysseus in The Odyssey?", "Athena"),
-        ("In the Odyssey, Odysseus was helped by what goddess?", "Athena")
-    ]
-    qa_pairs = [(re.sub(r'\s+', ' ', q.strip()), a.strip()) for q, a in qa_pairs if q and a]
+        # Validate and augment QA pairs
+        def is_valid_qa_pair(question, answer):
+            if not question.strip() or not answer.strip():
+                logging.warning(f"Invalid QA pair: empty question or answer (question='{question[:50]}...', answer='{answer[:50]}...')")
+                return False
+            try:
+                text = f"Question: {question} Answer: {answer}"
+                tokens = tokenizer(
+                    text,
+                    return_tensors="np",
+                    padding="max_length",
+                    truncation=True,
+                    max_length=64
+                )["input_ids"]
+                non_pad_count = np.sum(tokens != tokenizer.pad_token_id)
+                if tokens.shape[1] > 64 or non_pad_count < 4:
+                    logging.warning(f"Invalid QA pair: tokens_shape={tokens.shape}, non_pad_count={non_pad_count}, text='{text[:50]}...'")
+                    return False
+                if np.any(tokens < 0) or np.any(tokens >= tokenizer.vocab_size + len(tokenizer.all_special_tokens)):
+                    logging.warning(f"Invalid tokens in QA pair: min={np.min(tokens)}, max={np.max(tokens)}, text='{text[:50]}...'")
+                    return False
+                if any(c not in string.printable for c in text):
+                    logging.warning(f"Non-printable characters in QA pair: text='{text[:50]}...'")
+                    return False
+                return True
+            except Exception as e:
+                logging.warning(f"QA pair validation failed: {str(e)}, text='{text[:50]}...'")
+                return False
 
-    # Generate synthetic QA pairs
-    print("Generating synthetic QA pairs...")
-    for i, text in enumerate(filtered_texts[:100]):
-        qa_pairs.extend(generate_qa_pairs(text, max_pairs=10))
-    print(f"Added {len(qa_pairs)} synthetic QA pairs")
+        augmented_pairs = []
+        for question, answer in qa_pairs:
+            augmented_pairs.append((question, answer))
+            syn_question = synonym_replacement(question)
+            if is_valid_qa_pair(syn_question, answer):
+                augmented_pairs.append((syn_question, answer))
+            para_question = paraphrase_question(question)
+            if is_valid_qa_pair(para_question, answer):
+                augmented_pairs.append((para_question, answer))
+            bt_question, bt_answer = back_translation(question, answer)
+            if is_valid_qa_pair(bt_question, bt_answer):
+                augmented_pairs.append((bt_question, bt_answer))
+        qa_pairs = augmented_pairs
+        logging.info(f"Total QA pairs after augmentation: {len(qa_pairs)}, Sample: {qa_pairs[:5]}")
 
-    # Validate and augment QA pairs
-    def is_valid_qa_pair(question, answer):
-        if not question.strip() or not answer.strip():
-            logging.warning(f"Invalid QA pair: empty question or answer (question='{question[:50]}...', answer='{answer[:50]}...')")
-            return False
+        # Preprocess QA data
+        qa_texts = [f"Question: {q} Answer: {a}" for q, a in qa_pairs]
+        logging.info(f"Total QA texts: {len(qa_texts)}, Sample: {qa_texts[:5]}")
+
+        # Clear tokenized QA cache
+        for npy_file in glob.glob(os.path.join(tokenized_dir, "qa_*.npy")):
+            safe_remove(npy_file)
+
+        # Tokenize QA data
+        print("Tokenizing QA data...")
+        qa_input_ids = load_or_tokenize_texts(
+            qa_texts,
+            tokenizer,
+            tokenized_dir,
+            "qa",
+            batch_size=100,
+            max_length=64
+        )
+        qa_input_ids = validate_tokens(qa_input_ids, tokenizer.vocab_size + len(tokenizer.all_special_tokens))
+        print(f"Tokenized QA data shape: {qa_input_ids.shape}")
+        mx.eval(qa_input_ids)
+
+        # Initialize model and optimizer
+        vocab_size_with_special = tokenizer.vocab_size + len(tokenizer.all_special_tokens)
+        generative_model = BabyLLM(
+            vocab_size=vocab_size_with_special,
+            d_model=768,
+            n_layers=12,
+            n_heads=12,
+            d_ff=3078,
+            max_len=128
+        )
+        optimizer = optim.Adam(learning_rate=1e-4)
+        
+        # Load checkpoint if available
+        generative_model, optimizer_state, start_epoch = load_checkpoint(
+            generative_model, optimizer, pretrain_checkpoint_path, model_dir
+        )
+        optimizer.state = optimizer_state
+
+        # Validate parameters immediately
+        validate_model_params(generative_model, step=start_epoch)
+        logging.info("Model parameters validated successfully after initialization or loading")
+
+        # Test forward pass with a small batch
+        test_batch = input_ids[:1]  # Single sample for testing
         try:
-            text = f"Question: {question} Answer: {answer}"
-            tokens = tokenizer(
-                text,
-                return_tensors="np",
-                padding="max_length",
-                truncation=True,
-                max_length=64  # Reduced for QA pairs
-            )["input_ids"]
-            non_pad_count = np.sum(tokens != tokenizer.pad_token_id)
-            if tokens.shape[1] > 64 or non_pad_count < 4:  # Relaxed threshold
-                logging.warning(f"Invalid QA pair: tokens_shape={tokens.shape}, non_pad_count={non_pad_count}, text='{text[:50]}...'")
-                return False
-            if np.any(tokens < 0) or np.any(tokens >= tokenizer.vocab_size + len(tokenizer.all_special_tokens)):
-                logging.warning(f"Invalid tokens in QA pair: min={np.min(tokens)}, max={np.max(tokens)}, text='{text[:50]}...'")
-                return False
-            if any(c not in string.printable for c in text):
-                logging.warning(f"Non-printable characters in QA pair: text='{text[:50]}...'")
-                return False
-            return True
+            logits = generative_model(test_batch[:, :-1])
+            if logits is None or mx.any(mx.isnan(logits)) or mx.any(mx.isinf(logits)):
+                logging.error("NaN/Inf in test forward pass output")
+                raise ValueError("Invalid output in test forward pass")
+            logging.info("Test forward pass successful")
         except Exception as e:
-            logging.warning(f"QA pair validation failed: {str(e)}, text='{text[:50]}...'")
-            return False
+            logging.error(f"Test forward pass failed: {str(e)}")
+            raise
 
-    augmented_pairs = []
-    for question, answer in qa_pairs:
-        augmented_pairs.append((question, answer))
-        syn_question = synonym_replacement(question)
-        if is_valid_qa_pair(syn_question, answer):
-            augmented_pairs.append((syn_question, answer))
-        # Skip context_aware_synonym if using custom tokenizer
-        para_question = paraphrase_question(question)
-        if is_valid_qa_pair(para_question, answer):
-            augmented_pairs.append((para_question, answer))
-        bt_question, bt_answer = back_translation(question, answer)
-        if is_valid_qa_pair(bt_question, bt_answer):
-            augmented_pairs.append((bt_question, bt_answer))
+        logging.info(f"Input IDs stats: min={mx.min(input_ids).item()}, max={mx.max(input_ids).item()}, shape={input_ids.shape}")
+        if mx.any(mx.isnan(input_ids)) or mx.any(mx.isinf(input_ids)):
+            logging.error("NaN/Inf in input_ids")
+            raise ValueError("Invalid input_ids")
 
-    qa_pairs = augmented_pairs
-    logging.info(f"Total QA pairs after augmentation: {len(qa_pairs)}, Sample: {qa_pairs[:5]}")
+        # Pretraining loop
+        print("Starting pretraining...")
+        scheduler = CosineWarmup(learning_rate=1e-4, warmup_steps=100, total_steps=1000)
+        state = [generative_model, optimizer.state]
+        batch_size_lm = 4
+        num_epochs = 3
+        for epoch in range(start_epoch, num_epochs):
+            indices = mx.random.permutation(input_ids.shape[0])
+            print(f"Pretraining epoch {epoch}, total batches: {len(indices) // batch_size_lm}")
+            for i in range(0, len(indices), batch_size_lm):
+                batch_indices = indices[i:i + batch_size_lm]
+                batch = input_ids[batch_indices]
+                if (i // batch_size_lm) % 500 == 0:
+                    print(f"Pretraining epoch {epoch}, batch {i // batch_size_lm}, batch shape: {batch.shape}")
+                try:
+                    # Inspect parameters before forward pass
+                    logging.info(f"Epoch {epoch}, Step {i//batch_size_lm}: Inspecting parameters before forward pass")
+                    for k, v in flatten_parameters(generative_model.parameters()).items():
+                        logging.debug(f"Pre-forward param {k}: shape={v.shape}, dtype={v.dtype}, "
+                                     f"min={mx.min(v).item()}, max={mx.max(v).item()}")
+                    
+                    loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_lm, initial_scale=1.0)
+                    if loss is None:
+                        logging.warning(f"Skipping batch {i//batch_size_lm} due to invalid loss")
+                        continue
+                    
+                    # Inspect parameters after forward pass
+                    logging.info(f"Epoch {epoch}, Step {i//batch_size_lm}: Inspecting parameters after forward pass")
+                    for k, v in flatten_parameters(generative_model.parameters()).items():
+                        logging.debug(f"Post-forward param {k}: shape={v.shape}, dtype={v.dtype}, "
+                                     f"min={mx.min(v).item()}, max={mx.max(v).item()}")
+                    
+                    grads = clip_gradients(grads, max_norm=0.1)
+                    optimizer.update(generative_model, grads)
+                    mx.eval(generative_model.parameters(), optimizer.state)
+                    logging.info(f"Epoch {epoch}, Step {i//batch_size_lm}, Loss: {loss.item():.4f}, Scale: {scale:.4f}")
+                    
+                    # Validate parameters
+                    validate_model_params(generative_model, i // batch_size_lm)
+                except Exception as e:
+                    logging.error(f"Error in pretraining step {i//batch_size_lm}: {str(e)}")
+                    raise
+            
+            # Save checkpoint after each epoch
+            save_checkpoint(generative_model, optimizer, epoch, model_dir)
 
-    # Preprocess QA data
-    qa_texts = [f"Question: {q} Answer: {a}" for q, a in qa_pairs]
-    logging.info(f"Total QA texts: {len(qa_texts)}, Sample: {qa_texts[:5]}")
+        # Fine-tuning
+        print("Starting fine-tuning...")
+        batch_size_qa = 8
+        for epoch in range(start_epoch, num_epochs):
+            indices = mx.random.permutation(qa_input_ids.shape[0])
+            print(f"Fine-tuning epoch {epoch}, total batches: {len(indices) // batch_size_qa}")
+            for i in range(0, len(indices), batch_size_qa):
+                batch_indices = indices[i:i + batch_size_qa]
+                batch = qa_input_ids[batch_indices]
+                if (i // batch_size_qa) % 100 == 0:
+                    print(f"Fine-tuning epoch {epoch}, batch {i // batch_size_qa}, batch shape: {batch.shape}")
+                
+                loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_qa)
+                if loss is None:
+                    continue
+                grads = clip_gradients(grads)
+                optimizer.update(generative_model, grads)
+                mx.eval(generative_model.parameters(), optimizer.state)
+                logging.info(f"Fine-tuning Epoch {epoch}, Step {i//batch_size_qa}, Loss: {loss.item():.4f}")
+            
+            # Save checkpoint after each epoch
+            save_checkpoint(generative_model, optimizer, epoch, model_dir)
 
-    # Clear tokenized QA cache
-    for npy_file in glob.glob(os.path.join(tokenized_dir, "qa_*.npy")):
-        safe_remove(npy_file)
-
-    # Tokenize QA data
-    print("Tokenizing QA data...")
-    qa_input_ids = load_or_tokenize_texts(
-        qa_texts,
-        tokenizer,
-        tokenized_dir,
-        "qa",
-        batch_size=100,
-        max_length=64
-    )
-    qa_input_ids = validate_tokens(qa_input_ids, tokenizer.vocab_size + len(tokenizer.all_special_tokens))
-    print(f"Tokenized QA data shape: {qa_input_ids.shape}")
-    mx.eval(qa_input_ids)
-
-        # Initialize model
-    vocab_size_with_special = tokenizer.vocab_size + len(tokenizer.all_special_tokens)
-    generative_model = BabyLLM(
-        vocab_size=vocab_size_with_special,
-        d_model=128,
-        n_layers=4,
-        n_heads=8,
-        d_ff=512,
-        max_len=128
-    )
-
-    # Pretraining
-    print("Starting pretraining...")
-    optimizer = optim.Adam(learning_rate=1e-4)
-    scheduler = CosineWarmup(learning_rate=1e-4, warmup_steps=100, total_steps=1000)
-    state = [generative_model, optimizer.state]
-    batch_size_lm = 2
-    for epoch in range(3):
-        indices = mx.random.permutation(input_ids.shape[0])  # Keep as MLX array
-        for i in range(0, len(indices), batch_size_lm):
-            batch_indices = indices[i:i + batch_size_lm]
-            batch = input_ids[batch_indices]
-            loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_lm)
-            if loss is None:
-                continue
-            grads = clip_gradients(grads)
-            optimizer.update(generative_model, grads)
-            mx.eval(generative_model.parameters(), optimizer.state)
-            logging.info(f"Epoch {epoch}, Step {i//batch_size_lm}, Loss: {loss.item():.4f}")
-        mx.savez(pretrain_checkpoint_path, **flatten_parameters(generative_model.parameters()))
-
-    # Fine-tuning
-    print("Starting fine-tuning...")
-    batch_size_qa = 16
-    for epoch in range(3):
-        indices = mx.random.permutation(qa_input_ids.shape[0])
-        for i in range(0, len(indices), batch_size_qa):
-            batch_indices = indices[i:i + batch_size_qa]
-            batch = qa_input_ids[batch_indices]
-            loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_qa)
-            if loss is None:
-                continue
-            grads = clip_gradients(grads)
-            optimizer.update(generative_model, grads)
-            mx.eval(generative_model.parameters(), optimizer.state)
-            logging.info(f"Fine-tuning Epoch {epoch}, Step {i//batch_size_qa}, Loss: {loss.item():.4f}")
-
-            # Validation prompts
-    validation_prompts = [
+        # Validation prompts
+        validation_prompts = [
             ("Who killed Hamlet's dad?", "Claudius"),
             ("Who is Huck's friend?", "Tom"),
             ("Who loved Juliet?", "Romeo"),
@@ -1563,19 +1777,29 @@ if __name__ == '__main__':
             ("Who captained the Pequod?", "Ahab"),
             ("What is the name of Ahab's ship?", "Pequod")
         ]
-    val_texts = [f"Question: {q} Answer: {a}" for q, a in validation_prompts]
-    val_input_ids = load_or_tokenize_texts(
-        val_texts,
-        tokenizer,
-        tokenized_dir,
-        "val",
-        batch_size=50,
-        max_length=64
-    )
-    val_input_ids = validate_tokens(val_input_ids, tokenizer.vocab_size + len(tokenizer.all_special_tokens))
-    print(f"Tokenized validation data shape: {val_input_ids.shape}")
-    mx.eval(val_input_ids)
+        val_texts = [f"Question: {q} Answer: {a}" for q, a in validation_prompts]
+        val_input_ids = load_or_tokenize_texts(
+            val_texts,
+            tokenizer,
+            tokenized_dir,
+            "val",
+            batch_size=50,
+            max_length=64
+        )
+        val_input_ids = validate_tokens(val_input_ids, tokenizer.vocab_size + len(tokenizer.all_special_tokens))
+        print(f"Tokenized validation data shape: {val_input_ids.shape}")
+        mx.eval(val_input_ids)
 
-    # Evaluate
-    metrics = evaluate_qa(generative_model, tokenizer, validation_prompts)
-    logging.info(f"Validation metrics: {metrics}")
+        # Evaluate
+        metrics = evaluate_qa(generative_model, tokenizer, validation_prompts)
+        logging.info(f"Validation metrics: {metrics}")
+        print(f"Validation metrics: {metrics}")
+
+    except Exception as e:
+        logging.error(f"Main process error: {str(e)}")
+        raise
+    ##finally:
+      ##  log_queue.put(None)
+      ##  log_process.join(timeout=30)
+      ##  if log_process.is_alive():
+      ##      log_process.terminate()
