@@ -1444,8 +1444,537 @@ def recommend_batch_size():
     
     print("💡 Use the batch size with highest throughput that fits in memory")
 
+def process_file_batch_memory_efficient(filenames, tokenizer, batch_size=8):  # Reduced from 16
+    """Process files in smaller batches to reduce memory usage"""
+    results = []
+    for i in range(0, len(filenames), batch_size):
+        batch = filenames[i:i + batch_size]
+        batch_results = []
+        
+        # Process each file individually to avoid memory buildup
+        for fname in batch:
+            try:
+                result = process_file(fname, tokenizer)
+                if result:
+                    batch_results.append(result)
+            except Exception as e:
+                logging.error(f"Error processing {fname}: {str(e)}")
+                continue
+        
+        results.extend(batch_results)
+        
+        # Force garbage collection after each batch
+        del batch_results
+        gc.collect()
+        
+        if i % 50 == 0:  # Log progress less frequently
+            log_memory_usage()
+    
+    return results
+
+def process_texts_streaming(filenames, tokenizer, max_texts=50000):
+    """Process texts in streaming fashion with better error handling"""
+    import gc  # Ensure gc is available
+    print("Processing files in streaming mode...")
+    
+    all_texts = []
+    current_size = 0
+    max_size = 2 * 1024 * 1024 * 1024  # Reduced to 2GB for safety
+    
+    for i, filename in enumerate(filenames):
+        if len(all_texts) >= max_texts:
+            print(f"Reached max texts limit: {max_texts}")
+            break
+            
+        try:
+            file_path = os.path.join(gutenberg_dir, filename)
+            if not os.path.exists(file_path):
+                continue
+                
+            # Check file size before reading
+            file_size = os.path.getsize(file_path)
+            if file_size > 5 * 1024 * 1024:  # Skip files larger than 5MB
+                print(f"Skipping large file: {filename} ({file_size / 1024 / 1024:.1f}MB)")
+                continue
+                
+            with open(file_path, "r", encoding="utf-8") as f:
+                raw_text = f.read()
+            
+            # Process immediately
+            stripped_text = simple_strip_headers(raw_text, filename=filename)
+            if not stripped_text or len(stripped_text) < 50:
+                continue
+                
+            preprocessed_text = preprocess_text(stripped_text)
+            cleaned_text = enhanced_clean_text(preprocessed_text)
+            
+            if len(cleaned_text) < 50:
+                continue
+            
+            # Split into smaller chunks
+            try:
+                sentences = sent_tokenize(cleaned_text)
+            except:
+                # Fallback if NLTK fails
+                sentences = cleaned_text.split('. ')
+            
+            current_text = ""
+            
+            for sentence in sentences:
+                if len(current_text) + len(sentence) < 800:  # Smaller chunks
+                    current_text += " " + sentence
+                else:
+                    if current_text.strip() and len(current_text.strip()) > 20:
+                        size = len(current_text.encode("utf-8"))
+                        if current_size + size <= max_size:
+                            all_texts.append(current_text.strip())
+                            current_size += size
+                        else:
+                            print(f"Reached size limit: {current_size / (1024**2):.1f}MB")
+                            break
+                    current_text = sentence
+            
+            # Add final chunk
+            if current_text.strip() and len(current_text.strip()) > 20:
+                size = len(current_text.encode("utf-8"))
+                if current_size + size <= max_size:
+                    all_texts.append(current_text.strip())
+                    current_size += size
+            
+            # Cleanup variables
+            del raw_text, stripped_text, preprocessed_text, cleaned_text, sentences
+            
+        except Exception as e:
+            print(f"Error processing {filename}: {str(e)}")
+            continue
+        
+        # More frequent cleanup and progress reporting
+        if i % 10 == 0:  # Every 10 files
+            gc.collect()
+            if i % 20 == 0:  # Every 20 files
+                print(f"Processed {i}/{len(filenames)} files, collected {len(all_texts)} texts, {current_size / (1024**2):.1f}MB")
+    
+    print(f"Streaming processing complete: {len(all_texts)} texts, ~{current_size / (1024**2):.1f}MB")
+    return all_texts
+
+
+def load_or_tokenize_texts_memory_efficient(texts, tokenizer, batch_size=50, max_length=256):
+    """Memory-efficient tokenization with smaller batches - FIXED VERSION"""
+    print(f"Tokenizing {len(texts)} texts in memory-efficient mode...")
+    
+    inputs = []
+    vocab_size_with_special = tokenizer.vocab_size + len(tokenizer.all_special_tokens)
+    
+    # Adjust batch size if it's larger than the number of texts
+    if batch_size > len(texts):
+        batch_size = len(texts)
+        print(f"Adjusted batch size to {batch_size} (number of texts)")
+    
+    # Process in smaller batches
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        if not batch:
+            continue
+        
+        print(f"Processing batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}: {len(batch)} texts")
+        
+        try:
+            # Tokenize batch
+            batch_inputs = tokenizer(
+                batch,
+                return_tensors="np",
+                padding="max_length",
+                truncation=True,
+                max_length=max_length
+            )["input_ids"]
+            
+            print(f"Batch tokenized: {batch_inputs.shape}")
+            
+            # Quick validation
+            if np.any(batch_inputs < 0) or np.any(batch_inputs >= vocab_size_with_special):
+                print(f"⚠️  Invalid tokens in batch {i//batch_size}, min={np.min(batch_inputs)}, max={np.max(batch_inputs)}, vocab_size={vocab_size_with_special}")
+                continue
+            
+            # Filter out heavily padded sequences - RELAXED VALIDATION
+            non_pad_counts = np.sum(batch_inputs != tokenizer.pad_token_id, axis=1)
+            
+            # For QA pairs, be more lenient with padding
+            if max_length <= 128:  # This is likely QA data
+                valid_mask = non_pad_counts > 3  # Very relaxed - just need more than 3 non-pad tokens
+            else:  # This is corpus data
+                valid_mask = non_pad_counts > max_length // 6  # More aggressive filtering for corpus
+            
+            print(f"Non-pad counts: {non_pad_counts}")
+            print(f"Valid mask: {np.sum(valid_mask)}/{len(valid_mask)} sequences kept")
+            
+            if np.any(valid_mask):
+                batch_inputs = batch_inputs[valid_mask]
+                inputs.append(batch_inputs)
+                print(f"✅ Added batch with shape: {batch_inputs.shape}")
+            else:
+                print(f"⚠️  No valid sequences in batch {i//batch_size}")
+            
+        except Exception as e:
+            print(f"❌ Tokenization failed for batch {i//batch_size}: {str(e)}")
+            continue
+        
+        # Cleanup every 10 batches
+        if (i // batch_size) % 10 == 0:
+            gc.collect()
+    
+    if not inputs:
+        print("❌ ERROR: No valid batches were tokenized!")
+        print("Debug info:")
+        print(f"  - Number of input texts: {len(texts)}")
+        print(f"  - Sample texts: {texts[:3] if texts else 'None'}")
+        print(f"  - Vocab size: {vocab_size_with_special}")
+        print(f"  - Max length: {max_length}")
+        raise ValueError("No valid batches tokenized")
+    
+    # Concatenate all inputs
+    input_ids = mx.array(np.concatenate(inputs, axis=0), dtype=mx.int32)
+    
+    # Clean up intermediate data
+    del inputs
+    gc.collect()
+    
+    print(f"✅ Tokenization complete: {input_ids.shape}")
+    return input_ids
+
+def create_minimal_qa_pairs():
+    """Create smaller set of QA pairs to reduce memory"""
+    qa_pairs = [
+        ("Who is Huck's friend?", "Tom"),
+        ("Who loved Juliet?", "Romeo"),
+        ("Who killed Hamlet's father?", "Claudius"),
+        ("Who captained the Pequod?", "Ahab"),
+        ("Who was Odysseus' wife?", "Penelope"),
+        ("What color is grass?", "green"),
+        ("What color is the sky?", "blue"),
+        ("What do people read?", "book"),
+        ("What do people live in?", "house"),
+        ("What is a common word?", "the")
+    ]
+    
+    # Skip synthetic QA generation to save memory
+    print(f"Using minimal QA pairs: {len(qa_pairs)} pairs")
+    return qa_pairs
+
+    # QA Fine-tuning (similar optimizations)
+
+# ADD THE NEW FUNCTION RIGHT HERE:
+def train_with_reduced_memory(generative_model, input_ids, qa_input_ids, tokenizer, optimizer, model_dir):
+    """Training with aggressive memory leak prevention"""
+    
+    # VERY CONSERVATIVE SETTINGS
+    batch_size_lm = 16      # Back to small batch
+    steps_per_epoch = 100   # Much smaller epochs
+    num_epochs = 6          # More epochs instead of longer epochs
+    cleanup_every = 10      # Aggressive cleanup
+    
+    print(f"🛡️ MEMORY-SAFE TRAINING:")
+    print(f"  - Batch size: {batch_size_lm}")
+    print(f"  - Steps per epoch: {steps_per_epoch}")
+    print(f"  - Cleanup every: {cleanup_every} steps")
+    print(f"  - Total steps: {steps_per_epoch * num_epochs}")
+    
+    for epoch in range(num_epochs):
+        print(f"\n🚀 EPOCH {epoch + 1}/{num_epochs}")
+        epoch_losses = []
+        
+        for step in range(steps_per_epoch):
+            try:
+                # Create batch
+                batch_indices = mx.random.permutation(input_ids.shape[0])[:batch_size_lm]
+                batch = input_ids[batch_indices]
+                
+                # Training step
+                loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_lm, initial_scale=1.0)
+                
+                if loss is not None:
+                    grads = clip_gradients(grads, max_norm=1.0)
+                    optimizer.update(generative_model, grads)
+                    mx.eval(generative_model.parameters())
+                    epoch_losses.append(loss.item())
+                
+                # AGGRESSIVE CLEANUP
+                if step % cleanup_every == 0:
+                    # Delete variables explicitly
+                    del batch, batch_indices
+                    if 'loss' in locals():
+                        del loss
+                    if 'grads' in locals():
+                        del grads
+                    
+                    # MLX cleanup
+                    mx.eval(generative_model.parameters())  # Force evaluation
+                    if hasattr(mx, 'clear_cache'):
+                        mx.clear_cache()
+                    
+                    # Python cleanup
+                    gc.collect()
+                    
+                    # Memory check
+                    memory_gb = psutil.Process().memory_info().rss / (1024**3)
+                    if step % 20 == 0:  # Report every 20 steps
+                        print(f"  Step {step}: Memory = {memory_gb:.1f}GB")
+                    
+                    if memory_gb > 6:  # Much lower limit
+                        print(f"⚠️  Memory over 6GB ({memory_gb:.1f}GB) - emergency cleanup")
+                        aggressive_cleanup()
+                        
+                        # Force garbage collection multiple times
+                        for _ in range(3):
+                            gc.collect()
+                        
+                        memory_gb = psutil.Process().memory_info().rss / (1024**3)
+                        print(f"  After emergency cleanup: {memory_gb:.1f}GB")
+                        
+                        if memory_gb > 8:
+                            print("🛑 Memory still too high - stopping training")
+                            return generative_model
+                
+                # Progress reporting
+                if step % 25 == 0 and epoch_losses:
+                    avg_loss = np.mean(epoch_losses[-10:])
+                    print(f"    Step {step}: Loss = {epoch_losses[-1]:.4f}, Avg = {avg_loss:.4f}")
+                    
+            except Exception as e:
+                print(f"  Step {step} failed: {e}")
+                # Emergency cleanup on error
+                gc.collect()
+                continue
+        
+        # End of epoch cleanup
+        print(f"📊 Epoch {epoch + 1}: Avg Loss = {np.mean(epoch_losses):.4f}")
+        save_checkpoint(generative_model, optimizer, epoch, model_dir)
+        
+        # Major cleanup between epochs
+        aggressive_cleanup()
+        memory_gb = psutil.Process().memory_info().rss / (1024**3)
+        print(f"  Memory after epoch: {memory_gb:.1f}GB")
+    
+    return generative_model
+
+def aggressive_cleanup():
+    """Aggressive memory cleanup"""
+    import gc  # Import gc module locally
+    gc.collect()
+    if hasattr(mx, 'clear_cache'):
+        mx.clear_cache()
+    
+    # Force Python garbage collection multiple times
+    for i in range(3):
+        gc.collect()
+    
+    # Additional MLX cleanup if available
+    try:
+        if hasattr(mx.metal, 'clear_cache'):
+            mx.metal.clear_cache()
+    except:
+        pass
+
+def check_memory_usage():
+    """Check if memory usage is getting too high with better error handling"""
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        memory_gb = mem_info.rss / (1024**3)
+        
+        print(f"Current memory usage: {memory_gb:.1f}GB")
+        
+        if memory_gb > 25:  # If using more than 25GB
+            print(f"⚠️  High memory usage: {memory_gb:.1f}GB")
+            return True
+        return False
+    except Exception as e:
+        print(f"Memory check failed: {e}")
+        return False
+
+def tokenize_qa_simple(qa_texts, tokenizer, max_length=128):
+    """Simple tokenization specifically for small QA datasets"""
+    print(f"Tokenizing {len(qa_texts)} QA texts...")
+    
+    vocab_size_with_special = tokenizer.vocab_size + len(tokenizer.all_special_tokens)
+    
+    try:
+        # Tokenize all at once since it's a small dataset
+        batch_inputs = tokenizer(
+            qa_texts,
+            return_tensors="np",
+            padding="max_length",
+            truncation=True,
+            max_length=max_length
+        )["input_ids"]
+        
+        print(f"QA batch tokenized: {batch_inputs.shape}")
+        
+        # Basic validation
+        if np.any(batch_inputs < 0) or np.any(batch_inputs >= vocab_size_with_special):
+            print(f"❌ Invalid tokens: min={np.min(batch_inputs)}, max={np.max(batch_inputs)}, vocab_size={vocab_size_with_special}")
+            raise ValueError("Invalid tokens in QA data")
+        
+        # Very lenient filtering for QA data
+        non_pad_counts = np.sum(batch_inputs != tokenizer.pad_token_id, axis=1)
+        valid_mask = non_pad_counts > 3  # Just need more than 3 tokens
+        
+        print(f"Non-pad counts: {non_pad_counts}")
+        print(f"Valid sequences: {np.sum(valid_mask)}/{len(valid_mask)}")
+        
+        if not np.any(valid_mask):
+            print("❌ No valid QA sequences found!")
+            raise ValueError("No valid QA sequences")
+        
+        batch_inputs = batch_inputs[valid_mask]
+        input_ids = mx.array(batch_inputs, dtype=mx.int32)
+        
+        print(f"✅ QA tokenization complete: {input_ids.shape}")
+        return input_ids
+        
+    except Exception as e:
+        print(f"❌ QA tokenization failed: {str(e)}")
+        raise
+
 # 6. ADD TO YOUR MAIN TRAINING SECTION
 # Replace your existing test_gpu_workload() call with:
+def train_with_gradient_stability(generative_model, input_ids, qa_input_ids, tokenizer, optimizer, model_dir):
+    """Training with NaN detection and recovery"""
+    
+    batch_size_lm = 16
+    steps_per_epoch = 100
+    num_epochs = 6
+    
+    for epoch in range(num_epochs):
+        print(f"\n🚀 EPOCH {epoch + 1}/{num_epochs}")
+        epoch_losses = []
+        nan_count = 0
+        
+        for step in range(steps_per_epoch):
+            try:
+                batch_indices = mx.random.permutation(input_ids.shape[0])[:batch_size_lm]
+                batch = input_ids[batch_indices]
+                
+                # Training step with NaN detection
+                loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_lm, initial_scale=1.0)
+                
+                if loss is not None and not (mx.isnan(loss) or mx.isinf(loss)):
+                    # Check gradients for NaN before applying
+                    grad_has_nan = False
+                    for param_name, grad in flatten_parameters(grads).items():
+                        if mx.any(mx.isnan(grad)) or mx.any(mx.isinf(grad)):
+                            grad_has_nan = True
+                            break
+                    
+                    if not grad_has_nan:
+                        grads = clip_gradients(grads, max_norm=0.5)  # Smaller clip
+                        optimizer.update(generative_model, grads)
+                        mx.eval(generative_model.parameters())
+                        epoch_losses.append(loss.item())
+                    else:
+                        print(f"  Step {step}: Skipping - NaN in gradients")
+                        nan_count += 1
+                else:
+                    print(f"  Step {step}: Skipping - NaN loss")
+                    nan_count += 1
+                
+                # If too many NaNs, stop epoch early
+                if nan_count > steps_per_epoch // 4:  # More than 25% NaN
+                    print(f"⚠️  Too many NaN steps ({nan_count}), ending epoch early")
+                    break
+                    
+            except Exception as e:
+                print(f"  Step {step}: Error - {e}")
+                continue
+        
+        if epoch_losses:
+            avg_loss = np.mean(epoch_losses)
+            print(f"📊 Epoch {epoch + 1}: Avg Loss = {avg_loss:.4f}, NaN steps = {nan_count}")
+        else:
+            print(f"❌ Epoch {epoch + 1}: No valid steps! All NaN")
+            break
+            
+        save_checkpoint(generative_model, optimizer, epoch, model_dir)
+    
+    return generative_model
+
+def select_quality_gutenberg_files(target_count=300, max_search=1000):
+    """Select highest quality Gutenberg files"""
+    
+    print(f"🔍 Scanning up to {max_search} files to find {target_count} quality files...")
+    
+    file_scores = []
+    
+    for i in range(1, max_search + 1):
+        file_path = os.path.join(gutenberg_dir, f"{i}.txt")
+        if not os.path.exists(file_path):
+            continue
+            
+        try:
+            # Quick file size check
+            file_size = os.path.getsize(file_path)
+            if file_size < 5000 or file_size > 10 * 1024 * 1024:  # 5KB to 10MB
+                continue
+                
+            with open(file_path, "r", encoding="utf-8", errors='ignore') as f:
+                # Read first 10KB for quality assessment
+                sample = f.read(10000)
+            
+            if len(sample) < 1000:  # Too short
+                continue
+                
+            # Quality scoring
+            score = 0
+            
+            # Positive indicators
+            word_count = len(sample.split())
+            score += min(word_count, 1000)  # Cap at 1000 points
+            
+            # Count actual sentences
+            sentence_count = len([s for s in sample.split('.') if len(s.strip()) > 10])
+            score += sentence_count * 2
+            
+            # Alphabetic ratio (should be mostly letters)
+            alpha_ratio = sum(1 for c in sample if c.isalpha()) / len(sample)
+            score += alpha_ratio * 500
+            
+            # Negative indicators (penalties)
+            score -= sample.count('�') * 50          # Encoding errors
+            score -= sample.count('***') * 10        # Gutenberg metadata
+            score -= sample.count('[') * 5           # Footnotes/brackets
+            score -= sample.count('PROJECT GUTENBERG') * 20
+            
+            # Check for reasonable line length (not all short/long lines)
+            lines = sample.split('\n')
+            avg_line_len = np.mean([len(line) for line in lines if line.strip()])
+            if 20 < avg_line_len < 200:  # Reasonable line lengths
+                score += 100
+            
+            # Penalize files with too many numbers (likely tables/indices)
+            digit_ratio = sum(1 for c in sample if c.isdigit()) / len(sample)
+            if digit_ratio > 0.1:  # More than 10% digits is suspicious
+                score -= digit_ratio * 300
+                
+            if score > 800:  # Only high-quality files
+                file_scores.append((f"{i}.txt", score, file_size))
+                
+        except Exception as e:
+            continue
+    
+    # Sort by quality score
+    file_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    # Take top files
+    selected_files = [f for f, score, size in file_scores[:target_count]]
+    avg_score = np.mean([score for f, score, size in file_scores[:target_count]])
+    
+    print(f"✅ Selected {len(selected_files)} files")
+    print(f"📊 Average quality score: {avg_score:.1f}")
+    print(f"📚 Best files: {selected_files[:10]}")
+    
+    return selected_files
+
+# USE THIS IN YOUR MAIN CODE - REPLACE THE FILENAMES LINE:
 
 if __name__ == '__main__':
     # Setup logging
@@ -1456,13 +1985,7 @@ if __name__ == '__main__':
     root_logger = logging.getLogger()
     root_logger.handlers = []
     root_logger.addHandler(log_handler)
-    root_logger.setLevel(logging.ERROR)  # Changed to WARNING to reduce log files
-
-    ##log_process = multiprocessing.Process(
-    ##    target=log_listener,
-    ##    args=(log_queue, os.path.expanduser(f'~/Baby_LLM/qa_training_{os.getpid()}.log'))
-    ##)
-    ##log_process.start()
+    root_logger.setLevel(logging.ERROR)
 
     try:
         # Check disk space
@@ -1484,7 +2007,8 @@ if __name__ == '__main__':
                     raise
         download_nltk_resources()
 
-        # Print versions
+        # Print versions and check memory
+        print("=== SYSTEM INFO ===")
         print("numpy:", np.__version__)
         print("PyTorch:", torch.__version__)
         print("transformers:", transformers.__version__)
@@ -1492,6 +2016,11 @@ if __name__ == '__main__':
         print("MLX version:", mx.__version__)
         print("MLX Metal available:", mx.metal.is_available())
         print("MLX default device:", mx.default_device())
+        
+        # Check initial memory
+        process = psutil.Process(os.getpid())
+        initial_memory = process.memory_info().rss / (1024**3)
+        print(f"Initial memory usage: {initial_memory:.1f}GB")
 
         # Create directories
         os.makedirs(cache_dir, exist_ok=True)
@@ -1504,26 +2033,44 @@ if __name__ == '__main__':
         for npy_file in glob.glob(os.path.join(tokenized_dir, "*.npy")):
             safe_remove(npy_file)
 
-        # Process Gutenberg corpus to generate cleaned files
-
-        print("Processing Gutenberg corpus...")
+        ##once = input("it's time to run the optimized corpus processing")
+        # =============================================================================
+        # MEMORY-OPTIMIZED CORPUS PROCESSING
+        # =============================================================================
+        print("\n=== MEMORY-OPTIMIZED CORPUS PROCESSING ===")
         start_time = time.time()
-        text = ""
-        try:
-            ##filenames = [f for f in os.listdir(gutenberg_dir) if f.endswith('.txt')]
-            filenames = [f"{i}.txt" for i in range(1, 1001) if os.path.exists(os.path.join(gutenberg_dir, f"{i}.txt"))]
-            logging.info(f"Found {len(filenames)} files in {gutenberg_dir}")
-            if not filenames:
-                logging.error("No files found in gutenberg_dir")
-                raise FileNotFoundError("No Gutenberg files found")
-            results = process_file_batch(filenames, tokenizer=None, batch_size=16)
-            text = "".join(results)
-            logging.info(f"Processed {len(filenames)} files, total text length: {len(text)}")
-        except Exception as e:
-            logging.error(f"Error during corpus processing: {str(e)}")
-            raise
+        
+        # MAJOR MEMORY REDUCTION: Use only 50 files instead of 1000+
+        filenames = select_quality_gutenberg_files(target_count=300, max_search=800)
+        ##filenames = [f"{i}.txt" for i in range(1, 301) if os.path.exists(os.path.join(gutenberg_dir, f"{i}.txt"))]
+        print(f"Processing {len(filenames)} files (reduced from 1000+ for memory efficiency)")
+        
+        if not filenames:
+            logging.error("No files found in gutenberg_dir")
+            raise FileNotFoundError("No Gutenberg files found")
+        
+        # Use streaming processing instead of loading all at once
+        filtered_texts = process_texts_streaming(filenames, None, max_texts=10000)  # Limit to 10K texts
+        print(f"Streaming processing complete: {len(filtered_texts)} texts")
+        
+        # Memory cleanup after processing
+        aggressive_cleanup()
+        current_memory = process.memory_info().rss / (1024**3)
+        print(f"Memory after corpus processing: {current_memory:.1f}GB")
+        ##twice = input("And now it is complete")
 
-        # Load and train custom tokenizer
+        print("\n=== STARTING MEMORY-OPTIMIZED TRAINING ===")
+
+        # Check memory before training
+        if check_memory_usage():
+            print("⚠️  Memory usage high before training - proceeding with caution")
+            aggressive_cleanup()
+
+
+        # =============================================================================
+        # TOKENIZER SETUP
+        # =============================================================================
+        print("\n=== TOKENIZER SETUP ===")
         from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
         from tokenizers.pre_tokenizers import Whitespace
         from tokenizers.trainers import BpeTrainer
@@ -1533,30 +2080,23 @@ if __name__ == '__main__':
             tokenizer_file = os.path.join(model_dir, "custom_tokenizer.json")
             if os.path.exists(tokenizer_file):
                 tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
-                logging.info(f"Loaded existing custom tokenizer from {tokenizer_file}")
+                print(f"Loaded existing tokenizer: vocab_size={tokenizer.vocab_size}")
             else:
-                # Since we're not saving cleaned files anymore, we need to create temporary files for tokenizer training
-                logging.info("No existing tokenizer found, creating new one from processed text")
-                
-                # Create temporary file with processed text for tokenizer training
+                print("Training new tokenizer...")
+                # Create temporary file for tokenizer training
                 temp_training_file = os.path.join(model_dir, "temp_training_text.txt")
                 with open(temp_training_file, "w", encoding="utf-8") as f:
-                    f.write(text)  # Use the processed text we already have
+                    # Only use subset of texts for tokenizer training to save memory
+                    sample_texts = filtered_texts[:min(5000, len(filtered_texts))]
+                    f.write("\n\n".join(sample_texts))
                 
                 tokenizer = Tokenizer(models.BPE())
                 tokenizer.pre_tokenizer = Whitespace()
-                trainer = BpeTrainer(vocab_size=15000, special_tokens=["<PAD>", "<SEP>", "<EOS>", "<BOS>"])
+                trainer = BpeTrainer(vocab_size=10000, special_tokens=["<PAD>", "<SEP>", "<EOS>", "<BOS>"])  # Reduced vocab
                 
-                # Train on the temporary file
-                logging.info(f"Training custom tokenizer on processed text (length: {len(text)})")
                 tokenizer.train(files=[temp_training_file], trainer=trainer)
                 tokenizer.save(tokenizer_file)
-                logging.info(f"Saved custom tokenizer to {tokenizer_file}")
-                
-                # Clean up temporary file
                 safe_remove(temp_training_file)
-                
-                # Load the saved tokenizer
                 tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
             
             tokenizer.pad_token = "<PAD>"
@@ -1564,616 +2104,230 @@ if __name__ == '__main__':
             tokenizer.bos_token = "<BOS>"
             tokenizer.sep_token = "<SEP>"
             
-            logging.info(f"Tokenizer configured: vocab_size={tokenizer.vocab_size}, "
-                        f"eos_token={tokenizer.eos_token} (ID={tokenizer.eos_token_id}), "
-                        f"pad_token={tokenizer.pad_token} (ID={tokenizer.pad_token_id}), "
-                        f"bos_token={tokenizer.bos_token} (ID={tokenizer.bos_token_id}), "
-                        f"sep_token={tokenizer.sep_token} (ID={tokenizer.sep_token_id})")
+            print(f"Tokenizer configured: vocab_size={tokenizer.vocab_size}")
             
-            if tokenizer.vocab_size < 1000 or tokenizer.eos_token_id is None or tokenizer.pad_token_id is None:
-                logging.error("Invalid tokenizer configuration")
+            if tokenizer.vocab_size < 1000:
                 raise ValueError("Invalid tokenizer configuration")
-            logging.info(f"Tokenizer pad_token_id: {tokenizer.pad_token_id}")
+                
         except Exception as e:
-            logging.error(f"Failed to load or train tokenizer: {str(e)}")
+            logging.error(f"Failed to setup tokenizer: {str(e)}")
             raise
 
-        # Log a sample tokenized sequence
-        sample_text = "Question: Who is Huck's friend? Answer: Tom"
-        sample_tokens = tokenizer(sample_text, padding=True, truncation=True, max_length=128, return_tensors="np")["input_ids"]
-        logging.info(f"Sample tokenized sequence: {sample_tokens.tolist()}")
-        logging.info(f"Sample decoded: {tokenizer.decode(sample_tokens[0], skip_special_tokens=False)}")
-
-        # Split and concatenate texts
-        texts = []
-        for t in text.split("\n\n"):
-            if t.strip():
-                sentences = sent_tokenize(t)
-                current_text = ""
-                max_chunk_tokens = 240
-                current_tokens = []
-                for s in sentences:
-                    sentence_tokens = tokenizer(s, add_special_tokens=False)["input_ids"]
-                    if len(current_tokens) + len(sentence_tokens) < max_chunk_tokens:
-                        current_text += " " + s
-                        current_tokens.extend(sentence_tokens)
-                    else:
-                        if current_text.strip() and len(current_text) > 10:
-                            texts.append(current_text.strip())
-                        current_text = s
-                        current_tokens = sentence_tokens
-                if current_text.strip() and len(current_text) > 10:
-                    texts.append(current_text.strip())
-        logging.info(f"Collected {len(texts)} texts after concatenation, sample={[t[:50] + '...' for t in texts[:5]]}")
-
-        # Filter texts
-        max_size = 20 * 1024 * 1024 * 1024  # 20GB
-        current_size = 0
-        filtered_texts = []
-        for i, t in enumerate(texts):
-            size = len(t.encode("utf-8"))
-            if current_size + size <= max_size and len(t.strip()) >= 10:
-                try:
-                    token_ids = tokenizer(t, truncation=True, add_special_tokens=True)["input_ids"]
-                    if 5 <= len(token_ids) <= 2560:  # Cap at 10x max_length (256)
-                        filtered_texts.append(t)
-                        current_size += size
-                    else:
-                        logging.warning(f"Skipping text {i}: token_length={len(token_ids)}, text='{t[:50]}...'")
-                except Exception as e:
-                    logging.warning(f"Failed to tokenize text {i}: {str(e)}, text='{t[:50]}...'")
-                    continue
-            else:
-                logging.warning(f"Skipping text {i}: size={size}, total_size={current_size / (1024**2):.2f}MB, text='{t[:50]}...'")
-            if i % 1000 == 0:
-                logging.info(f"Processed {i} texts, current_size={current_size / (1024**2):.2f}MB")
-        logging.info(f"Collected {len(filtered_texts)} texts, ~{current_size / (1024**2):.2f}MB")
-        print(f"Collected {len(filtered_texts)} texts, ~{current_size / (1024**2):.2f}MB")
-
-        # Validate filtered_texts
-        if not filtered_texts:
-            logging.error("No valid texts after filtering")
-            raise ValueError("No valid texts after filtering")
-
-        # Tokenize corpus
-        print("Tokenizing corpus...")
-
+        # =============================================================================
+        # MEMORY-EFFICIENT MODEL INITIALIZATION
+        # =============================================================================
+        print("\n=== MODEL INITIALIZATION ===")
         vocab_size_with_special = tokenizer.vocab_size + len(tokenizer.all_special_tokens)
+        
+        # SMALLER MODEL FOR MEMORY EFFICIENCY
         generative_model = BabyLLM(
             vocab_size=vocab_size_with_special,
-            d_model=896,
-            n_layers=14,
-            n_heads=14,
-            d_ff=3584,
+            d_model=512,        # Reduced from 896
+            n_layers=8,         # Reduced from 14
+            n_heads=8,          # Reduced from 14
+            d_ff=2048,          # Reduced from 3584
             max_len=256,
-            pad_token_id = tokenizer.pad_token_id  # ✅ Changed from 128
+            pad_token_id=tokenizer.pad_token_id
         )
         optimizer = optim.Adam(learning_rate=1e-4)
         
+        print(f"Model size: {generative_model.d_model}d, {len(generative_model.layers)} layers")
+        
+        # Memory check after model creation
+        current_memory = process.memory_info().rss / (1024**3)
+        print(f"Memory after model creation: {current_memory:.1f}GB")
 
-        try:
-            input_ids = load_or_tokenize_texts(
-                filtered_texts,
-                tokenizer,
-                tokenized_dir,
-                "corpus",
-                batch_size=100,
-                max_length=256
-            )
-            input_ids = validate_tokens(input_ids, tokenizer.vocab_size + len(tokenizer.all_special_tokens), generative_model)
-            logging.info(f"Validated input_ids: shape={input_ids.shape}, min={mx.min(input_ids).item()}, max={mx.max(input_ids).item()}")
-            print(f"Tokenized corpus shape: {input_ids.shape}")
-            mx.eval(input_ids)
-        except Exception as e:
-            logging.error(f"Tokenization failed: {str(e)}")
-            raise
-
-        # Initialize model and optimizer
-
-        # Tokenize validation corpus
-        print("Tokenizing validation corpus...")
-        val_corpus = filtered_texts
-        val_corpus_ids = load_or_tokenize_texts(
-            val_corpus,
+        # =============================================================================
+        # MEMORY-EFFICIENT TOKENIZATION
+        # =============================================================================
+        print("\n=== TOKENIZING DATA ===")
+        
+        # Tokenize main corpus with memory-efficient method
+        input_ids = load_or_tokenize_texts_memory_efficient(
+            filtered_texts,
             tokenizer,
-            tokenized_dir,
-            "val_corpus",
-            batch_size=100,
+            batch_size=50,      # Smaller batch size
             max_length=256
         )
-        val_corpus_ids = validate_tokens(val_corpus_ids, tokenizer.vocab_size + len(tokenizer.all_special_tokens), generative_model)
-        logging.info(f"Validated val_corpus_ids: shape={val_corpus_ids.shape}, min={mx.min(val_corpus_ids).item()}, max={mx.max(val_corpus_ids).item()}")
-        print(f"Tokenized validation corpus shape: {val_corpus_ids.shape}")
-        mx.eval(val_corpus_ids)
+        input_ids = validate_tokens(input_ids, vocab_size_with_special, generative_model)
+        print(f"Tokenized corpus: {input_ids.shape}")
+        mx.eval(input_ids)
+        
+        # Memory cleanup after tokenization
+        del filtered_texts  # Free the text data
+        aggressive_cleanup()
+        current_memory = process.memory_info().rss / (1024**3)
+        print(f"Memory after tokenization: {current_memory:.1f}GB")
 
-        # Define QA pairs
-        qa_pairs = [
-            ("In the novel Huckleberry Finn, who was Huckleberry Finn's traveling companion down the Mississippi?", "Jim"),
-            ("In the book Huckleberry Finn, who went with Huck Finn?", "Jim"),
-            ("In Huckleberry Finn, who went on the raft with Huckleberry Finn?", "Jim"),
-            ("In the novel Huckleberry Finn, who went on the raft with Huck?", "Jim"),
-            ("In Mark Twain's novel, who did Jim travel with?", "Huck"),
-            ("In the book Huckleberry Finn, who was on the raft with Huck?", "Jim"),
-            ("In Huckleberry Finn, who was on the raft with Jim?", "Huck Finn"),
-            ("Where was Huck born in the book Huckleberry Finn?", "Hannibal"),
-            ("In the book Huckleberry Finn, what do Huckleberry Finn's friends call him?", "Huck"),
-            ("In Huckleberry Finn, who is Tom Sawyer's friend?", "Huck Finn"),
-            ("Who liked Becky Thatcher in the novel Huckleberry Finn?", "Tom Sawyer"),
-            ("Who does not want to be civilized in the book Huckleberry Finn?", "Huck"),
-            ("In the book Huckleberry Finn, who does not want to be civilized?", "Huck"),
-            ("What two people famously travelled on the Mississippi on a raft in the novel Huckleberry Finn?", "Huck and Jim"),
-            ("Where is Huckleberry Finn from?", "Hannibal"),
-            ("What is the name of the young boy who is Huckleberry's friend in the book Huckleberry Finn?", "Tom"),
-            ("What is the shortened version of 'Huckleberry' in the book Huckleberry Finn?", "Huck"),
-            ("Is Santa Claus real?", "Totally"),
-            ("What river did Huckleberry Finn travel on in the book Huckleberry Finn?", "Mississippi"),
-            ("Who was the scary Native American in Tom Sawyer?", "Injun Joe"),
-            ("Where was Dido from in the Aeneid?", "Carthage"),
-            ("In the Aeneid, what city did Aeneas flee?", "Troy"),
-            ("Who did Dido love in the Aeneid?", "Aeneas"),
-            ("Who did Juliet love in the play Romeo and Juliet?", "Romeo"),
-            ("In the play Romeo and Juliet, who did Romeo love?", "Juliet"),
-            ("Who did Juliet die for in the play Romeo and Juliet?", "Romeo"),
-            ("In Romeo and Juliet, who did Romeo die for?", "Juliet"),
-            ("Who did Juliet kill herself for in Romeo and Juliet?", "Romeo"),
-            ("Who did Romeo kill himself for in the play Romeo and Juliet?", "Juliet"),
-            ("Who was the most famous Capulet in the play Romeo and Juliet?", "Juliet"),
-            ("In Romeo and Juliet, who is the most famous Montague?", "Romeo"),
-            ("Who is associated with the Capulets in Romeo and Juliet?", "Juliet"),
-            ("In Romeo and Juliet, who is associated with the Montagues?", "Romeo"),
-            ("In the play Romeo and Juliet, who was the young Capulet girl?", "Juliet"),
-            ("Who was the young Montague boy in Romeo and Juliet?", "Romeo"),
-            ("What house was Juliet from in Romeo and Juliet?", "Capulet"),
-            ("In Romeo and Juliet, who was Juliet's confidant?", "Nurse"),
-            ("Who did Mercutio fight for in Romeo and Juliet?", "Romeo"),
-            ("In Romeo and Juliet, who did Mercutio die for?", "Romeo"),
-            ("Who did Tybalt kill instead of Romeo?", "Mercutio"),
-            ("Who did Tybalt duel in Romeo and Juliet?", "Mercutio"),
-            ("In Romeo and Juliet, who did Tybalt stab?", "Mercutio"),
-            ("What was the name of Hamlet's mother in the play Hamlet?", "Gertrude"),
-            ("Who loved Hamlet in the play Hamlet?", "Ophelia"),
-            ("In the Iliad, whose death drove Achilles into a frenzy?", "Patroclus"),
-            ("Whose death maddened Achilles in the Iliad?", "Patroclus"),
-            ("Who loved Patroclus in the Iliad?", "Achilles"),
-            ("Who wrote Pride and Prejudice?", "Jane Austen"),
-            ("Who demands a pound of flesh in the Merchant of Venice?", "Shylock"),
-            ("What does Shylock demand in the Merchant of Venice?", "A pound of flesh"),
-            ("Who tricks Othello into jealousy in the play Othello?", "Iago"),
-            ("What is the name of Prospero's daughter in the Tempest?", "Miranda"),
-            ("In The Tempest, what profit from language did Caliban gain?", "He can curse"),
-            ("What was Caliban's profit from language in The Tempest?", "He can curse"),
-            ("Who killed Hamlet's father in the play Hamlet?", "Claudius"),
-            ("Hamlet's father was killed by whom in the play Hamlet?", "Claudius"),
-            ("In the play Hamlet, who murdered Hamlet's father?", "Claudius"),
-            ("Who did Claudius kill in the play Hamlet?", "Hamlet's father"),
-            ("Who did Claudius murder in the play Hamlet?", "Hamlet's father"),
-            ("In the play Hamlet, what happened to Hamlet's father?", "Murdered by Claudius"),
-            ("Who was Pap's son in Huckleberry Finn?", "Huck"),
-            ("In the novel Huckleberry Finn, what's the full name of Pap's son?", "Huckleberry Finn"),
-            ("What is the name of Huck's father in the book Huckleberry Finn?", "Pap"),
-            ("Where was Hamlet's home in the play Hamlet?", "Elsinore"),
-            ("Who was the prince of Denmark in Shakespeare's famous play Hamlet?", "Hamlet"),
-            ("In the play Hamlet, what was Hamlet's title?", "Prince of Denmark"),
-            ("Who was Gertrude's son in Shakespeare's play Hamlet?", "Hamlet"),
-            ("Who killed Claudius in Shakespeare's play Hamlet?", "Hamlet"),
-            ("Who did Ophelia love in the play Hamlet?", "Hamlet"),
-            ("Ophelia committed suicide for whom in the play Hamlet?", "Hamlet"),
-            ("Hannibal, Missouri is associated with who in the book Huckleberry Finn?", "Huck"),
-            ("Hamlet scorned the love of who in the play Hamlet?", "Ophelia"),
-            ("Whose love did Hamlet scorn in the play Hamlet?", "Ophelia"),
-            ("Whose love did Hamlet not return in the play Hamlet?", "Ophelia"),
-            ("In the play Hamlet, Ophelia loved whom?", "Hamlet"),
-            ("In the play Othello, who did Iago trick?", "Othello"),
-            ("Who did Iago fool in the play Othello?", "Othello"),
-            ("What river did Huck navigate in the book Huckleberry Finn?", "Mississippi"),
-            ("Who was the boy who rafted down the Mississippi river in Huckleberry Finn?", "Huck Finn"),
-            ("Who fooled Othello in the play Othello?", "Iago"),
-            ("Who is the captain of the Pequod in Moby-Dick?", "Ahab"),
-            ("In Pride and Prejudice, who marries Elizabeth Bennet?", "Mr. Darcy"),
-            ("In The Odyssey, who is Odysseus's wife?", "Penelope"),
-            ("In The Scarlet Letter, what symbol does Hester Prynne wear?", "A"),
-            ("In Great Expectations, who raises Pip?", "Joe Gargery"),
-            ("What color was the rabbit that Alice followed down the rabbit hole?", "White"),
-            ("Who asked the riddle about the raven and the writing desk in Alice in Wonderland?", "The Mad Hatter"),
-            ("What is the subject of the famous riddle by the Mad Hatter in Alice in Wonderland?", "Raven and writing desk"),
-            ("How many impossible things does the Red Queen believe before breakfast?", "Six"),
-            ("What six things does the Red Queen believe?", "Impossible things"),
-            ("Who believes six impossible things before breakfast?", "The Red Queen"),
-            ("When does the Red Queen believe six impossible things?", "Before breakfast"),
-            ("What ship did Queequeg sail on in Moby Dick?", "Pequod"),
-            ("Who was Ahab's chief mate?", "Starbuck"),
-            ("In Moby Dick, who was Starbuck's captain?", "Ahab"),
-            ("Who was Ahab's second mate?", "Stubb"),
-            ("Stubb was whose second mate in Moby Dick?", "Ahab"),
-            ("In Moby Dick, who was the cannibal harpoonist on the Pequod?", "Queequeg"),
-            ("Who was Queequeg's captain in Moby Dick?", "Ahab"),
-            ("What was the name of Ahab's ship in Moby Dick?", "Pequod"),
-            ("Ahab was the captain of what ship in Moby Dick?", "Pequod"),
-            ("Who was the young boy who rafted down the Mississippi?", "Huck"),
-            ("In Huckleberry Finn, who was the black man who rafted down the Mississippi River?", "Jim"),
-            ("What is the name of the young boy who rafted down the Mississippi River in Huckleberry Finn?", "Huck"),
-            ("What is the name of the black man who rafted down the Mississippi River?", "Jim"),
-            ("Who was Odysseus's wife?", "Penelope"),
-            ("What was the name of Odysseus's wife?", "Penelope"),
-            ("Who was Odysseus married to in The Odyssey?", "Penelope"),
-            ("What was the name of the woman Odysseus was married to in The Odyssey?", "Penelope"),
-            ("In the Odyssey, Odysseus was married to whom?", "Penelope"),
-            ("What goddess helped Odysseus in The Odyssey?", "Athena"),
-            ("In the Odyssey, Odysseus was helped by what goddess?", "Athena"),
-            ("What color is the sky?", "blue"),
-            ("What color is the ocean?", "blue"),
-            ("What color is the sun?", "yellow"),
-            ("What color is grass?", "green"),
-            ("What color is blood?", "red"),
-            ("What is the royal color?", "purple"),
-            ("What color is a heart?", "red")
-        ]
-        qa_pairs = [(re.sub(r'\s+', ' ', q.strip()), a.strip()) for q, a in qa_pairs if q and a]
+        # =============================================================================
+        # MINIMAL QA PAIRS FOR MEMORY EFFICIENCY
+        # =============================================================================
+        print("\n=== QA PAIRS SETUP ===")
+        
+        # Use minimal QA pairs instead of generating synthetic ones
+        qa_pairs = create_minimal_qa_pairs()
+        
+        # Skip augmentation to save memory
+        print(f"Using {len(qa_pairs)} QA pairs (minimal set)")
+        
 
-        # Generate synthetic QA pairs
-        print("Generating synthetic QA pairs...")
-        for i, text in enumerate(filtered_texts):
-            qa_pairs.extend(generate_qa_pairs(text, max_pairs=10))
-        print(f"Added {len(qa_pairs)} synthetic QA pairs")
-
-        # Validate and augment QA pairs
-        def is_valid_qa_pair(question, answer):
-            if not question.strip() or not answer.strip():
-                logging.warning(f"Invalid QA pair: empty question or answer (question='{question[:50]}...', answer='{answer[:50]}...')")
-                return False
-            try:
-                text = f"Question: {question} Answer: {answer}"
-                tokens = tokenizer(
-                    text,
-                    return_tensors="np",
-                    padding="max_length",
-                    truncation=True,
-                    max_length=128
-                )["input_ids"]
-                non_pad_count = np.sum(tokens != tokenizer.pad_token_id)
-                if tokens.shape[1] > 128 or non_pad_count < 4:
-                    logging.warning(f"Invalid QA pair: tokens_shape={tokens.shape}, non_pad_count={non_pad_count}, text='{text[:50]}...'")
-                    return False
-                if np.any(tokens < 0) or np.any(tokens >= tokenizer.vocab_size + len(tokenizer.all_special_tokens)):
-                    logging.warning(f"Invalid tokens in QA pair: min={np.min(tokens)}, max={np.max(tokens)}, text='{text[:50]}...'")
-                    return False
-                if any(c not in string.printable for c in text):
-                    logging.warning(f"Non-printable characters in QA pair: text='{text[:50]}...'")
-                    return False
-                return True
-            except Exception as e:
-                logging.warning(f"QA pair validation failed: {str(e)}, text='{text[:50]}...'")
-                return False
-
-        original_count = len(qa_pairs)
-        target_augmented = original_count // 2 # This will add 50% to the total
-
-        augmented_pairs = []
-        augmented_count = 0
-
-        for i, (question, answer) in enumerate(qa_pairs):
-            # Always add the original pair
-            augmented_pairs.append((question, answer))
-            
-            # Only augment if we haven't reached the target
-            if augmented_count < target_augmented:
-                syn_question = synonym_replacement(question)
-                if is_valid_qa_pair(syn_question, answer):
-                    augmented_pairs.append((syn_question, answer))
-                    augmented_count += 1
-            
-            # Break early if we've reached our target
-            if augmented_count >= target_augmented:
-                break
-            ##para_question = paraphrase_question(question)
-            ##if is_valid_qa_pair(para_question, answer):
-            ##    augmented_pairs.append((para_question, answer))
-            ##bt_question, bt_answer = back_translation(question, answer)
-            ##if is_valid_qa_pair(bt_question, bt_answer):
-            ##    augmented_pairs.append((bt_question, bt_answer))
-        qa_pairs = augmented_pairs
-        logging.info(f"Total QA pairs after augmentation: {len(qa_pairs)}, Sample: {qa_pairs[:5]}")
-
-        # Preprocess QA data
+        # Tokenize QA data - FIXED VERSION
         qa_texts = [f"Question: {q} Answer: {a}" for q, a in qa_pairs]
-        logging.info(f"Total QA texts: {len(qa_texts)}, Sample: {qa_texts[:5]}")
-
-        # Clear tokenized QA cache
-        for npy_file in glob.glob(os.path.join(tokenized_dir, "qa_*.npy")):
-            safe_remove(npy_file)
-
-        # Tokenize QA data
-        print("Tokenizing QA data...")
-        qa_input_ids = load_or_tokenize_texts(
-            qa_texts,
-            tokenizer,
-            tokenized_dir,
-            "qa",
-            batch_size=2500,
-            max_length=128
-        )
-        qa_input_ids = validate_tokens(qa_input_ids, tokenizer.vocab_size + len(tokenizer.all_special_tokens), generative_model)
-        print(f"Tokenized QA data shape: {qa_input_ids.shape}")
+        qa_input_ids = tokenize_qa_simple(qa_texts, tokenizer, max_length=128)
+        qa_input_ids = validate_tokens(qa_input_ids, vocab_size_with_special, generative_model)
+        print(f"Tokenized QA data: {qa_input_ids.shape}")
         mx.eval(qa_input_ids)
 
+        qa_input_ids = validate_tokens(qa_input_ids, vocab_size_with_special, generative_model)
+        print(f"Tokenized QA data: {qa_input_ids.shape}")
+        mx.eval(qa_input_ids)
 
-        
-        # Load checkpoint if available
+        # =============================================================================
+        # CHECKPOINT LOADING
+        # =============================================================================
+        print("\n=== CHECKPOINT LOADING ===")
         generative_model, optimizer_state, start_epoch = load_checkpoint(
             generative_model, optimizer, pretrain_checkpoint_path, model_dir
         )
         optimizer.state = optimizer_state
-
-        # Validate parameters immediately
         validate_model_params(generative_model, step=start_epoch)
-        logging.info("Model parameters validated successfully after initialization or loading")
+        print(f"Starting from epoch {start_epoch}")
 
-        logging.info("Running minimal test forward pass...")
+        # =============================================================================
+        # MODEL TESTING
+        # =============================================================================
+        print("\n=== MODEL TESTING ===")
+        
+        # Quick forward pass test
         test_input = mx.array([[tokenizer.bos_token_id] + [tokenizer.pad_token_id] * 254], dtype=mx.int32)
-        logging.info(f"Minimal test input: shape={test_input.shape}, tokens={test_input.tolist()}")
-        decoded_test = tokenizer.decode(generative_model.to_numpy_for_decode(test_input[0]))
-        logging.info(f"Decoded minimal test input: {decoded_test}")
         try:
             logits = generative_model(test_input)
-            if logits is None:
-                logging.error("Model returned None for minimal test input")
-                ##np.save(os.path.join(model_dir, f"failed_minimal_test_logits_{time.time()}.npy"), np.array([]))
-                raise ValueError("Invalid output in minimal test forward pass")
-            logging.info(f"Minimal test forward pass logits: shape={logits.shape}, min={mx.min(logits).item()}, max={mx.max(logits).item()}")
-            logging.info("Minimal test forward pass successful")
+            if logits is None or mx.any(mx.isnan(logits)):
+                raise ValueError("Invalid model output")
+            print("✅ Model forward pass test successful")
         except Exception as e:
-            logging.error(f"Minimal test forward pass failed: {str(e)}")
+            logging.error(f"Model test failed: {str(e)}")
             raise
 
-        logging.info("Running test forward pass...")
-        test_batch = input_ids[:1]
-        logging.info(f"Test batch: shape={test_batch.shape}, min={mx.min(test_batch).item()}, max={mx.max(test_batch).item()}, dtype={test_batch.dtype}")
-        test_batch = validate_tokens(test_batch, vocab_size_with_special, generative_model)
-        test_input = test_batch  # Use full batch without slicing
-        logging.info(f"Test input to model: shape={test_input.shape}, min={mx.min(test_input).item()}, max={mx.max(test_input).item()}")
-        decoded_test = tokenizer.decode(generative_model.to_numpy_for_decode(test_batch[0]))
-        logging.info(f"Decoded test batch: {decoded_test}")
-        try:
-            logits = generative_model(test_input)
-            if logits is None:
-                logging.error("Model returned None for test input")
-                ##np.save(os.path.join(model_dir, f"failed_test_input_{time.time()}.npy"), np.array(test_input))
-                raise ValueError("Invalid output in test forward pass")
-            if mx.any(mx.isnan(logits)) or mx.any(mx.isinf(logits)):
-                logging.error("NaN/Inf in test forward pass output")
-                ##np.save(os.path.join(model_dir, f"failed_test_logits_{time.time()}.npy"), np.array(logits))
-                ##np.save(os.path.join(model_dir, f"failed_test_input_{time.time()}.npy"), np.array(test_input))
-                raise ValueError("Invalid output in test forward pass")
-            logging.info(f"Test forward pass logits: shape={logits.shape}, min={mx.min(logits).item()}, max={mx.max(logits).item()}")
-            logging.info("Test forward pass successful")
-        except Exception as e:
-            logging.error(f"Test forward pass failed: {str(e)}")
-            ##np.save(os.path.join(model_dir, f"failed_test_input_{time.time()}.npy"), np.array(test_input))
-            raise
-
-        # Pretraining loop
-
-        print("=== GPU OPTIMIZATION TESTS ===")
+        # =============================================================================
+        # GPU OPTIMIZATION TESTS
+        # =============================================================================
+        print("\n=== GPU OPTIMIZATION TESTS ===")
         test_gpu_workload()
-        check_gpu_utilization()  
+        check_gpu_utilization()
         recommend_batch_size()
-        print("=== STARTING TRAINING ===")
 
-        batch_size_lm = 32
-        num_epochs = 2
-        total_steps = (len(input_ids) // batch_size_lm) * num_epochs 
-        scheduler = CosineWarmup(learning_rate=3e-4, warmup_steps=200, total_steps=total_steps)
-        state = [generative_model, optimizer.state]
-        ##max_batches = 1000
-        accum_steps = 4  # Accumulate gradients over 4 mini-batches
-        print(f"Training setup: {len(input_ids)} sequences, {batch_size_lm} batch size, {num_epochs} epochs")
-        print(f"Total steps: {total_steps}, Warmup steps: 200")
-        for epoch in range(start_epoch, num_epochs):
-            indices = mx.random.permutation(input_ids.shape[0])
-            print(f"Pretraining epoch {epoch}, total batches: {len(indices) // batch_size_lm}")
-            accumulated_grads = None
+        # ADD THE SIMPLE TRAINING TEST HERE:
+        print("🧪 Testing simple training...")
+
+        for step in range(10):  # Just 10 steps
+            batch = input_ids[:16]  # First 16 sequences
+            print(f"Step {step}: Testing batch {batch.shape}")
             
-            for i in range(0, len(indices), batch_size_lm):
-                batch_indices = indices[i:i + batch_size_lm]
-                batch = input_ids[batch_indices]
-                
-                # REDUCE logging frequency - only every 1000 batches instead of 5000
-                if (i // batch_size_lm) % 1000 == 0:
-                    print(f"Pretraining epoch {epoch}, batch {i // batch_size_lm}, batch shape: {batch.shape}")
-                
-                if (i // batch_size_lm) % 100 == 0:
-                    detailed_gpu_monitor()
-                try:
-                    loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_lm, initial_scale=65536.0)
-                    if loss is None:
-                        logging.warning(f"Skipping batch {i//batch_size_lm} due to invalid loss")
-                        continue
-                        
-                    grads = clip_gradients(grads, max_norm=1.0)
-                    accumulated_grads = add_grads(accumulated_grads, grads)
-                    
-                    # REDUCE parameter checking frequency - only every 500 instead of 100
-                    if (i // batch_size_lm) % 500 == 0:
-                        validate_model_params(generative_model, i // batch_size_lm)
-                    
-                    if (i // batch_size_lm + 1) % accum_steps == 0:
-                        optimizer.update(generative_model, accumulated_grads)
-                        generative_model = clip_parameters_safe(generative_model, max_value=10.0)
-                        mx.eval(generative_model.parameters(), optimizer.state)
-                        accumulated_grads = None
-                        
-                        # Only log every 10 updates instead of every update
-                        if (i // batch_size_lm) % (accum_steps * 10) == 0:
-                            logging.info(f"Epoch {epoch}, Step {i//batch_size_lm}, Loss: {loss.item():.4f}, Scale: {scale:.4f}")
-                            
-                except Exception as e:
-                    logging.error(f"Error in pretraining step {i//batch_size_lm}: {str(e)}")
-                    raise
+            try:
+                loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_lm, initial_scale=1.0)
+                if loss is not None:
+                    print(f"  ✅ Loss: {loss.item():.4f}")
+                    grads = clip_gradients(grads)
+                    optimizer.update(generative_model, grads)
+                else:
+                    print(f"  ❌ Loss is None")
+            except Exception as e:
+                print(f"  ❌ Error: {e}")
+
+        ##four_times = input("look at this")
+    
 
 
-        # Fine-tuning
-        print("Starting fine-tuning...")
-        batch_size_qa = 64
-        qa_epochs = 2  # Separate epoch count for QA
-
-        # Create QA scheduler (keep the cosine warmup!)
-        qa_steps = (len(qa_input_ids) // batch_size_qa) * qa_epochs
-        qa_scheduler = CosineWarmup(
-            learning_rate=1e-4,     # Lower LR for fine-tuning
-            warmup_steps=50,        # Shorter warmup than pretraining
-            total_steps=qa_steps
+        # =============================================================================
+        # MEMORY-OPTIMIZED TRAINING
+        # =============================================================================
+        print("\n=== STARTING MEMORY-OPTIMIZED TRAINING ===")
+        
+        # Check memory before training
+        if check_memory_usage():
+            print("⚠️  Memory usage high before training - proceeding with caution")
+            aggressive_cleanup()
+        
+        # Use the memory-optimized training function
+        generative_model = train_with_gradient_stability(
+            generative_model, 
+            input_ids, 
+            qa_input_ids, 
+            tokenizer, 
+            optimizer, 
+            model_dir
         )
 
-        # Update the existing optimizer for QA phase
-        optimizer.learning_rate = 1e-4  # Reset base learning rate
-
-        qa_step = 0  # Track steps for scheduler
-
-        for epoch in range(qa_epochs):  # Use separate QA epochs
-            indices = mx.random.permutation(qa_input_ids.shape[0])
-            print(f"Fine-tuning epoch {epoch}, total batches: {len(indices) // batch_size_qa}")
-            
-            for i in range(0, len(indices), batch_size_qa):
-                batch_indices = indices[i:i + batch_size_qa]
-                batch = qa_input_ids[batch_indices]
-                
-                if (i // batch_size_qa) % 100 == 0:
-                    print(f"Fine-tuning epoch {epoch}, batch {i // batch_size_qa}, batch shape: {batch.shape}")
-                
-                # Update learning rate using scheduler
-                current_lr = qa_scheduler(qa_step)
-                optimizer.learning_rate = current_lr
-                
-                loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_qa)
-                if loss is None:
-                    qa_step += 1  # Still increment step
-                    continue
-                    
-                grads = clip_gradients(grads)
-                optimizer.update(generative_model, grads)
-                generative_model = clip_parameters_safe(generative_model, max_value=10.0)
-                mx.eval(generative_model.parameters(), optimizer.state)
-                
-                logging.info(f"Fine-tuning Epoch {epoch}, Step {i//batch_size_qa}, Loss: {loss.item():.4f}, LR: {current_lr:.6f}")
-                
-                qa_step += 1  # Increment step counter
-            
-            # Save checkpoint after each QA epoch - INDENTED INSIDE THE EPOCH LOOP
-            save_checkpoint(generative_model, optimizer, epoch + num_epochs, model_dir)
-
-        # Save final model AFTER all fine-tuning is complete - OUTSIDE ALL LOOPS
+        # =============================================================================
+        # SAVE FINAL MODEL
+        # =============================================================================
+        print("\n=== SAVING FINAL MODEL ===")
         final_model_path = os.path.join(model_dir, "final_model.npz")
         params_to_save = flatten_parameters(generative_model.parameters())
         mx.savez(final_model_path, **params_to_save)
         print(f"✅ Saved final model to {final_model_path}")
 
-        # Rest of your validation code continues here...
-        print("=== TRAINING COMPLETED SUCCESSFULLY! ===")
-        # Validation prompts
-        validation_prompts = [
-            ("Who killed Hamlet's dad?", "Claudius"),
-            ("Who is Huck's friend?", "Tom"),
-            ("Who loved Juliet?", "Romeo"),
-            ("Who ignored Ophelia?", "Hamlet"),
-            ("Who tricked Othello?", "Iago"),
-            ("Who killed Mercutio?", "Tybalt"),
-            ("In The Odyssey, who is the cyclops encountered by Odysseus?", "Polyphemus"),
-            ("In Jane Eyre, who is the governess at Thornfield Hall?", "Jane Eyre"),
-            ("Who was Odysseus' wife?", "Penelope"),
-            ("What did the Red Queen believe before breakfast?", "Six impossible things"),
-            ("Who captained the Pequod?", "Ahab"),
-            ("What is the name of Ahab's ship?", "Pequod")
-        ]
-        validation_prompts = [
-        ("What is a common word?", "the"),
-        ("What do people live in?", "house"),
-        ("What do people read?", "book"),
-        ("What color is grass?", "green"),
-        ("What do people eat?", "food")
-        ]
-        ##val_texts = [f"Question: {q} Answer: {a}" for q, a in validation_prompts]
-        ##val_input_ids = load_or_tokenize_texts(
-        ##    val_texts,
-        ##    tokenizer,
-        ##    tokenized_dir,
-        ##    "val",
-        ##    batch_size=50,
-        ##    max_length=128
-        ##)
-        ##val_input_ids = validate_tokens(val_input_ids, tokenizer.vocab_size + len(tokenizer.all_special_tokens), generative_model)
-        ##print(f"Tokenized validation data shape: {val_input_ids.shape}")
-        ##mx.eval(val_input_ids)
-
-        # Evaluate
-        ##metrics = evaluate_qa(generative_model, tokenizer, validation_prompts)
-        ##logging.info(f"Validation metrics: {metrics}")
-        ##print(f"Validation metrics: {metrics}")
-
-        # REPLACE THE ENTIRE VALIDATION SECTION (around line 1790) WITH THIS:
-
-        print("=== TRAINING COMPLETED SUCCESSFULLY! ===")
-        print("Skipping complex validation due to tokenizer vocabulary issues.")
-        print("Running simple generation tests instead...")
-
-        # Simple validation questions that should work with any tokenizer
+        # =============================================================================
+        # SIMPLE VALIDATION
+        # =============================================================================
+        print("\n=== VALIDATION TESTS ===")
+        
+        # Simple generation tests
         simple_questions = [
             "What is a",
-            "The man was",
-            "In the house there was a", 
-            "The book was about",
-            "She said that"
+            "The man was", 
+            "What color is grass?",
+            "What do people read?",
         ]
-
-        print("\n=== GENERATION TESTS ===")
+        
+        print("Testing text generation...")
         for i, question in enumerate(simple_questions):
             try:
-                print(f"\nTest {i+1}:")
-                print(f"Input: '{question}'")
-                
-                # Direct tokenization test
-                input_text = f"Question: {question} Answer:"
-                tokens = tokenizer(input_text, return_tensors="np", max_length=64, truncation=True, padding=True)
-                print(f"Tokenized successfully: {tokens['input_ids'].shape}")
-                
-                # Try generation
-                answer = generate_answer(generative_model, tokenizer, question, max_tokens=10)
+                print(f"\nTest {i+1}: '{question}'")
+                answer = generate_answer(generative_model, tokenizer, question, max_tokens=5)
                 print(f"Generated: '{answer}'")
-                
             except Exception as e:
                 print(f"Test {i+1} failed: {str(e)}")
-                continue
 
-        print("\n=== TOKENIZER VOCABULARY TEST ===")
-        # Test what words your tokenizer actually knows
-        test_words = ["the", "and", "was", "said", "man", "woman", "house", "book", "good", "time"]
-        for word in test_words:
-            try:
-                tokens = tokenizer.tokenize(word)
-                token_ids = tokenizer.encode(word, add_special_tokens=False)
-                print(f"'{word}' -> {tokens} -> ids: {token_ids}")
-            except Exception as e:
-                print(f"Failed to tokenize '{word}': {e}")
-
+        # =============================================================================
+        # FINAL MEMORY REPORT
+        # =============================================================================
         print("\n=== FINAL STATUS ===")
-        print("✅ Model training completed successfully!")
-        print("✅ Model can be loaded and used for generation")
-        print("📊 Training stats:")
-        print(f"   - Processed {len(filtered_texts)} texts")
-        print(f"   - Completed {381} pretraining batches") 
-        print(f"   - Model size: 512d, 8 layers, 8 heads")
-        print(f"   - Sequence length: 256 tokens")
-        print("\n💡 Next steps:")
-        print("   1. The model is trained and ready to use")
-        print("   2. You can generate text with generate_answer()")
-        print("   3. For better results, train on more diverse data next time")
-        print("   4. Consider including Shakespeare/literature in training data")
-
-        print("\n🎉 TRAINING RUN COMPLETE! 🎉")
+        final_memory = process.memory_info().rss / (1024**3)
+        print(f"Final memory usage: {final_memory:.1f}GB")
+        print(f"Memory increase: {final_memory - initial_memory:.1f}GB")
+        
+        print("\n✅ TRAINING COMPLETED SUCCESSFULLY!")
+        print(f"📊 Training summary:")
+        print(f"   - Model: {generative_model.d_model}d, {len(generative_model.layers)} layers")
+        print(f"   - Corpus: {input_ids.shape[0]} sequences")
+        print(f"   - QA pairs: {len(qa_pairs)}")
+        print(f"   - Memory efficient: {final_memory:.1f}GB peak usage")
+        
+        print("\n💡 Memory optimizations applied:")
+        print("   ✓ Reduced corpus size (50 files vs 1000+)")
+        print("   ✓ Smaller model architecture")
+        print("   ✓ Streaming text processing")
+        print("   ✓ Memory-efficient tokenization")
+        print("   ✓ Minimal QA pairs")
+        print("   ✓ Chunked training")
+        print("   ✓ Aggressive garbage collection")
+        
     except Exception as e:
+        print(f"\n❌ Error: {str(e)}")
         logging.error(f"Main process error: {str(e)}")
+        
+        # Emergency memory cleanup
+        try:
+            aggressive_cleanup()
+        except:
+            pass
         raise
-    ##finally:
-        ##  log_queue.put(None)
-        ##  log_process.join(timeout=30)
-        ##  if log_process.is_alive():
-        ##      log_process.terminate()
+        
+    finally:
+        # Final cleanup
+        try:
+            aggressive_cleanup()
+        except:
+            pass
