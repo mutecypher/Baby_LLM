@@ -988,8 +988,9 @@ def dynamic_loss_scale(model, batch, fn, initial_scale=65536.0):  # Increased fr
                 scale /= 2.0
                 attempt += 1
                 continue
-            # Check gradients for NaN/Inf
-            for k, g in flatten_parameters(grads).items():
+            # Check gradients for NaN/Inf - FIXED VERSION
+            flat_grads = flatten_parameters(grads)  # Get flat gradients first
+            for k, g in flat_grads.items():
                 if mx.any(mx.isnan(g)) or mx.any(mx.isinf(g)):
                     logging.warning(f"NaN/Inf in gradient {k} at scale {scale}, reducing scale")
                     scale /= 2.0
@@ -1436,7 +1437,7 @@ def process_texts_streaming(filenames, tokenizer, max_texts):
     
     all_texts = []
     current_size = 0
-    max_size = 2 * 1024 * 1024 * 1024  # Reduced to 2GB for safety
+    max_size = 2 * 1024 * 1024 * 1024  # Reduced to 5GB for safety
     
     for i, filename in enumerate(filenames):
         if len(all_texts) >= max_texts:
@@ -1450,7 +1451,7 @@ def process_texts_streaming(filenames, tokenizer, max_texts):
                 
             # Check file size before reading
             file_size = os.path.getsize(file_path)
-            if file_size > 30 * 1024 * 1024:  # Skip files larger than 25MB
+            if file_size > 30 * 1024 * 1024:  # Skip files larger than 30MB
                 print(f"Skipping large file: {filename} ({file_size / 1024 / 1024:.1f}MB)")
                 continue
                 
@@ -1487,7 +1488,7 @@ def process_texts_streaming(filenames, tokenizer, max_texts):
                             all_texts.append(current_text.strip())
                             current_size += size
                         else:
-                            print(f"Reached size limit: {current_size / (1024**4):.1f}MB")
+                            print(f"Reached size limit: {current_size / (1024*4):.1f}MB")
                             break
                     current_text = sentence
             
@@ -1811,7 +1812,9 @@ def train_with_gradient_stability(generative_model, input_ids, qa_input_ids, tok
             print(f"❌ Epoch {epoch + 1}: No valid steps! All NaN")
             break
             
-        save_checkpoint(generative_model, optimizer, epoch, model_dir)
+        checkpoint_path = os.path.join(model_dir, f"checkpoint_epoch_{epoch}")
+        save_model_mlx_native(generative_model, optimizer, checkpoint_path)
+        print(f"✅ Saved checkpoint for epoch {epoch}")
     
     return generative_model
 
@@ -1977,7 +1980,7 @@ def train_with_gradient_stability_refinement(generative_model, input_ids, qa_inp
     """Training with NaN detection and recovery - OPTIMIZED FOR REFINEMENT"""
     
     # REFINEMENT SETTINGS - More conservative
-    batch_size_lm = 16      
+    batch_size_lm = 32      
     steps_per_epoch = 100   # Fewer steps for refinement
     num_epochs = 10         # Fewer epochs for refinement
     
@@ -2041,7 +2044,9 @@ def train_with_gradient_stability_refinement(generative_model, input_ids, qa_inp
             print(f"❌ Refinement Epoch {epoch + 1}: No valid steps! All NaN")
             break
             
-        save_checkpoint(generative_model, optimizer, epoch + 1000, model_dir)  # Use 1000+ for refinement epochs
+        checkpoint_path = os.path.join(model_dir, f"checkpoint_epoch_{epoch + 1000}")
+        save_model_mlx_native(generative_model, optimizer, checkpoint_path)
+        print(f"✅ Saved refinement checkpoint for epoch {epoch + 1000}")
     
     return generative_model
 
@@ -2210,6 +2215,96 @@ def load_checkpoint(model, optimizer, checkpoint_path, model_dir):
     optimizer.state = {}
     return model, optimizer.state, 0
 
+# CORRECTED MLX NATIVE FUNCTIONS
+def save_model_mlx_native(model, optimizer, path):
+    """Use MLX's native save methods with proper type handling"""
+    try:
+        # Use MLX's native model saving (this works!)
+        model.save_weights(f"{path}_weights.npz")
+        print(f"✅ Saved model weights to {path}_weights.npz")
+        
+        # Save optimizer state with careful type handling
+        if hasattr(optimizer, 'state') and optimizer.state:
+            safe_state = {}
+            for k, v in optimizer.state.items():
+                try:
+                    if isinstance(v, (int, float)):
+                        # Convert Python numbers to MLX arrays with explicit dtype
+                        safe_state[k] = mx.array(float(v), dtype=mx.float32)
+                    elif isinstance(v, mx.array):
+                        # Ensure MLX arrays are float32
+                        safe_state[k] = v.astype(mx.float32)
+                    elif hasattr(v, 'item'):  # Handle scalar MLX arrays
+                        safe_state[k] = mx.array(float(v.item()), dtype=mx.float32)
+                    else:
+                        print(f"⚠️  Skipping optimizer state '{k}' (unsupported type: {type(v)})")
+                        continue
+                except Exception as e:
+                    print(f"⚠️  Failed to convert optimizer state '{k}': {e}")
+                    continue
+            
+            if safe_state:
+                mx.savez(f"{path}_opt.npz", **safe_state)
+                print(f"✅ Saved optimizer state to {path}_opt.npz")
+        
+    except Exception as e:
+        print(f"❌ Failed to save model: {str(e)}")
+        # Fallback to basic model saving without optimizer state
+        try:
+            model.save_weights(f"{path}_weights.npz")
+            print(f"✅ Saved model weights only (optimizer state failed)")
+        except Exception as e2:
+            print(f"❌ Even basic model saving failed: {str(e2)}")
+
+def load_model_mlx_native(model, optimizer, path):
+    """Use MLX's native load methods"""
+    weights_file = f"{path}_weights.npz"
+    opt_file = f"{path}_opt.npz"
+    
+    try:
+        if os.path.exists(weights_file):
+            # Use MLX's native model loading (this works!)
+            model.load_weights(weights_file)
+            print(f"✅ Loaded model weights from {weights_file}")
+            
+            # Load optimizer state if available
+            if os.path.exists(opt_file):
+                try:
+                    loaded_state = dict(mx.load(opt_file))
+                    optimizer.state = loaded_state
+                    print(f"✅ Loaded optimizer state from {opt_file}")
+                except Exception as e:
+                    print(f"⚠️  Could not load optimizer state: {e}")
+                    # Initialize fresh state
+                    optimizer.state = {
+                        "step": mx.array(0, dtype=mx.float32),
+                        "learning_rate": mx.array(1e-5, dtype=mx.float32)
+                    }
+            else:
+                # Initialize fresh optimizer state
+                optimizer.state = {
+                    "step": mx.array(0, dtype=mx.float32),
+                    "learning_rate": mx.array(1e-5, dtype=mx.float32)
+                }
+                print("🔧 Initialized fresh optimizer state")
+        else:
+            print(f"⚠️  Weights file not found: {weights_file}")
+            # Still initialize optimizer state
+            optimizer.state = {
+                "step": mx.array(0, dtype=mx.float32),
+                "learning_rate": mx.array(1e-5, dtype=mx.float32)
+            }
+    except Exception as e:
+        print(f"❌ Failed to load model: {str(e)}")
+        # Initialize fresh optimizer state on any failure
+        optimizer.state = {
+            "step": mx.array(0, dtype=mx.float32),
+            "learning_rate": mx.array(1e-5, dtype=mx.float32)
+        }
+    
+    return model, optimizer
+
+
 if __name__ == '__main__':
     # Setup logging
     log_queue = multiprocessing.Manager().Queue(maxsize=72500)
@@ -2275,7 +2370,7 @@ if __name__ == '__main__':
         start_time = time.time()
         
         # MAJOR MEMORY REDUCTION: Use 8000 files instead of 13000+
-        filenames = select_quality_gutenberg_files(target_count=9000, max_search=12000)
+        filenames = select_quality_gutenberg_files(target_count=2500, max_search=5000)
         ##filenames = [f"{i}.txt" for i in range(1, 301) if os.path.exists(os.path.join(gutenberg_dir, f"{i}.txt"))]
         print(f"Processing {len(filenames)} files (reduced from 13000+ for memory efficiency)")
         
@@ -2285,7 +2380,7 @@ if __name__ == '__main__':
             raise FileNotFoundError("No Gutenberg files found")
         
         # Use streaming processing instead of loading all at once
-        filtered_texts = process_texts_streaming(filenames, None, max_texts=5000000)  # Limit to 10K texts
+        filtered_texts = process_texts_streaming(filenames, None, max_texts=500000)  # Limit to 10K texts
         print(f"Streaming processing complete: {len(filtered_texts)} texts")
         
         # Memory cleanup after processing
@@ -2353,19 +2448,24 @@ if __name__ == '__main__':
         # =============================================================================
         print("\n=== MODEL INITIALIZATION ===")
         vocab_size_with_special = tokenizer.vocab_size + len(tokenizer.all_special_tokens)
-        
+
         # SMALLER MODEL FOR MEMORY EFFICIENCY
         generative_model = BabyLLM(
             vocab_size=vocab_size_with_special,
-            d_model=512,        # Reduced from 896
-            n_layers=16,         # Reduced from 14. good with 6....
-            n_heads=16,          # Reduced from 14
-            d_ff=2048,          # Reduced from 3584
+            d_model=512,        
+            n_layers=16,         
+            n_heads=16,          
+            d_ff=2048,          
             max_len=256,
             pad_token_id=tokenizer.pad_token_id
         )
+
+        # CREATE AND PROPERLY INITIALIZE OPTIMIZER
         optimizer = optim.Adam(learning_rate=1e-5)
-        
+        print("🔧 Initializing optimizer state...")
+        optimizer.state = {"step": 0}  # MLX optimizers need this
+        print("✅ Optimizer initialized with step counter")
+
         print(f"Model size: {generative_model.d_model}d, {len(generative_model.layers)} layers")
         
         # Memory check after model creation
@@ -2421,10 +2521,88 @@ if __name__ == '__main__':
         # CHECKPOINT LOADING
         # =============================================================================
         print("\n=== CHECKPOINT LOADING ===")
-        generative_model, optimizer_state, start_epoch = load_checkpoint(
-            generative_model, optimizer, pretrain_checkpoint_path, model_dir
-        )
-        optimizer.state = optimizer_state
+
+        import glob
+
+        # CHECK FOR FINAL MODELS FIRST (completed training)
+        final_model_path = os.path.join(model_dir, "final_model")
+        final_model_files = glob.glob(f"{final_model_path}_weights.npz")
+
+        if final_model_files:
+            print("🎯 Loading NEW format final model")
+            generative_model, optimizer = load_model_mlx_native(generative_model, optimizer, final_model_path)
+            start_epoch = 999  # Signal that this is a final model
+            print("✅ NEW format final model loaded successfully")
+            
+        else:
+            # Check for OLD format final model
+            old_final_model = os.path.join(model_dir, "final_model.npz")
+            
+            if os.path.exists(old_final_model):
+                print("🎯 Loading OLD format final model")
+                try:
+                    saved_params = mx.load(old_final_model)
+                    new_params = load_parameters_simple(generative_model, saved_params)
+                    generative_model.update(new_params)
+                    print("✅ OLD format final model loaded successfully")
+                    
+                    optimizer.state = {
+                        "step": mx.array(0, dtype=mx.float32),
+                        "learning_rate": mx.array(1e-5, dtype=mx.float32)
+                    }
+                    start_epoch = 999  # Signal that this is a final model
+                    
+                except Exception as e:
+                    print(f"❌ Failed to load old final model: {str(e)}")
+                    start_epoch = 0
+            else:
+                # ONLY IF NO FINAL MODEL - check for checkpoint files
+                print("🔍 No final model found, checking for checkpoint files...")
+                
+                # Check for NEW format checkpoints
+                checkpoint_files = glob.glob(os.path.join(model_dir, "checkpoint_epoch_*_weights.npz"))
+                
+                if checkpoint_files:
+                    latest_checkpoint = max(checkpoint_files, key=lambda x: int(os.path.basename(x).split('_epoch_')[1].split('_weights.npz')[0]))
+                    epoch_num = int(os.path.basename(latest_checkpoint).split('_epoch_')[1].split('_weights.npz')[0])
+                    checkpoint_path = os.path.join(model_dir, f"checkpoint_epoch_{epoch_num}")
+                    
+                    print(f"📊 Loading NEW format checkpoint from epoch {epoch_num}")
+                    generative_model, optimizer = load_model_mlx_native(generative_model, optimizer, checkpoint_path)
+                    start_epoch = epoch_num + 1
+                    print("✅ NEW format checkpoint loaded successfully")
+                    
+                else:
+                    # Check for OLD format checkpoints
+                    old_checkpoint_files = glob.glob(os.path.join(model_dir, "checkpoint_epoch_*.npz"))
+                    
+                    if old_checkpoint_files:
+                        latest_old_checkpoint = max(old_checkpoint_files, key=lambda x: int(os.path.basename(x).split('_epoch_')[1].split('.npz')[0]))
+                        epoch_num = int(os.path.basename(latest_old_checkpoint).split('_epoch_')[1].split('.npz')[0])
+                        
+                        print(f"📊 Loading OLD format checkpoint from epoch {epoch_num}")
+                        try:
+                            saved_params = mx.load(latest_old_checkpoint)
+                            new_params = load_parameters_simple(generative_model, saved_params)
+                            generative_model.update(new_params)
+                            print("✅ OLD format checkpoint loaded successfully")
+                            
+                            optimizer.state = {
+                                "step": mx.array(epoch_num * 150, dtype=mx.float32),
+                                "learning_rate": mx.array(1e-5, dtype=mx.float32)
+                            }
+                            start_epoch = epoch_num + 1
+                            
+                        except Exception as e:
+                            print(f"❌ Failed to load old checkpoint: {str(e)}")
+                            start_epoch = 0
+                    else:
+                        print("🆕 No checkpoints found, starting from scratch")
+                        optimizer.state = {
+                            "step": mx.array(0, dtype=mx.float32),
+                            "learning_rate": mx.array(1e-5, dtype=mx.float32)
+                        }
+                        start_epoch = 0
 
         # =============================================================================
         # HANDLE FINAL MODEL LOADING
@@ -2466,22 +2644,34 @@ if __name__ == '__main__':
         recommend_batch_size()
 
         # ADD THE SIMPLE TRAINING TEST HERE:
-        print("🧪 Testing simple training...")
+        print("🧪 Testing simple training with detailed debugging...")
 
         for step in range(10):  # Just 10 steps
             batch = input_ids[:16]  # First 16 sequences
-            print(f"Step {step}: Testing batch {batch.shape}")
+            print(f"Step {step}: About to call dynamic_loss_scale")
             
             try:
                 loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_lm, initial_scale=1.0)
+                print(f"  ✅ dynamic_loss_scale succeeded")
+                
                 if loss is not None:
                     print(f"  ✅ Loss: {loss.item():.4f}")
+                    
+                    print(f"  Testing clip_gradients...")
                     grads = clip_gradients(grads)
+                    print(f"  ✅ clip_gradients succeeded")
+                    
+                    print(f"  Testing optimizer.update...")
                     optimizer.update(generative_model, grads)
+                    print(f"  ✅ optimizer.update succeeded")
+                    
                 else:
                     print(f"  ❌ Loss is None")
             except Exception as e:
                 print(f"  ❌ Error: {e}")
+                import traceback
+                traceback.print_exc()
+                break
 
         # =============================================================================
         # MEMORY-OPTIMIZED TRAINING
@@ -2516,17 +2706,13 @@ if __name__ == '__main__':
                     model_dir
                 )
 
-            # =============================================================================
-            # SAVE FINAL MODEL
-            # =============================================================================
-            print("\n=== SAVING FINAL MODEL ===")
-            final_model_path = os.path.join(model_dir, "final_model.npz")
-            params_to_save = flatten_parameters(generative_model.parameters())
-            mx.savez(final_model_path, **params_to_save)
-            print(f"✅ Saved final model to {final_model_path}")
-        else:
-            print("⏭️  Skipping training")
-
+        # =============================================================================
+        # SAVE FINAL MODEL
+        # =============================================================================
+        print("\n=== SAVING FINAL MODEL ===")
+        final_model_path = os.path.join(model_dir, "final_model")
+        save_model_mlx_native(generative_model, optimizer, final_model_path)
+        print(f"✅ Saved final model to {final_model_path}")
         # =============================================================================
         # SIMPLE VALIDATION
         # =============================================================================
