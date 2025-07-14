@@ -412,121 +412,78 @@ def flatten_parameters(params, prefix=""):
             logging.warning(f"Skipping non-array parameter {new_key}: type={type(value)}")
     return flat_params
 
-def load_checkpoint(model, optimizer, checkpoint_path, model_dir):
-    """
-    Load the latest model and optimizer state from a checkpoint if available.
-    Returns the model, optimizer state, and the starting epoch.
-    """
-    import glob
-    checkpoint_files = glob.glob(os.path.join(model_dir, "checkpoint_epoch_*.npz"))
-    legacy_checkpoint = os.path.join(model_dir, "pretrain_checkpoint.npz")  # Support original checkpoint
 
-    # Check for legacy checkpoint
-    if os.path.exists(legacy_checkpoint):
-        logging.info(f"Found legacy checkpoint: {legacy_checkpoint}, loading as epoch 0")
-        try:
-            checkpoint = mx.load(legacy_checkpoint)
-            flat_params = flatten_parameters(model.parameters())
-            for key, value in checkpoint.items():
-                if key in flat_params:
-                    flat_params[key] = mx.array(value, dtype=mx.float16)
-                else:
-                    logging.warning(f"Skipping unexpected key in legacy checkpoint: {key}")
-            model.update(unflatten_parameters(flat_params, model))
-            validate_model_params(model, step=0)
-            logging.info("Legacy model parameters loaded and validated successfully")
-
-            # Check for legacy optimizer state
-            legacy_optimizer_state_file = legacy_checkpoint.replace('.npz', '_optimizer.npz')
-            if os.path.exists(legacy_optimizer_state_file):
-                optimizer_state = mx.load(legacy_optimizer_state_file)
-                optimizer.state = optimizer_state
-                logging.info("Legacy optimizer state loaded successfully")
-            else:
-                logging.warning("No legacy optimizer state found, reinitializing optimizer")
-                optimizer.reset()
-
-            return model, optimizer.state, 0  # Start from epoch 0 for legacy checkpoint
-        except Exception as e:
-            logging.error(f"Failed to load legacy checkpoint {legacy_checkpoint}: {str(e)}")
-            raise
-
-    # Check for epoch-based checkpoints
-    if not checkpoint_files:
-        logging.info("No epoch-based checkpoints found, starting training from scratch")
-        return model, optimizer.state, 0
-
-    # Find the latest checkpoint by epoch number
-    try:
-        latest_checkpoint = max(checkpoint_files, key=lambda x: int(os.path.basename(x).split('_epoch_')[1].split('.npz')[0]))
-        epoch = int(os.path.basename(latest_checkpoint).split('_epoch_')[1].split('.npz')[0])
-        logging.info(f"Found checkpoint: {latest_checkpoint}, resuming from epoch {epoch}")
-    except (IndexError, ValueError) as e:
-        logging.error(f"Error parsing checkpoint filenames: {str(e)}")
-        logging.info("Starting training from scratch due to invalid checkpoint names")
-        return model, optimizer.state, 0
-
-    try:
-        checkpoint = mx.load(latest_checkpoint)
-        flat_params = flatten_parameters(model.parameters())
-        for key, value in checkpoint.items():
-            if key in flat_params:
-                flat_params[key] = mx.array(value, dtype=mx.float16)
-            else:
-                logging.warning(f"Skipping unexpected key in checkpoint: {key}")
-        model.update(unflatten_parameters(flat_params, model))
-        validate_model_params(model, step=epoch)
-        logging.info("Model parameters loaded and validated successfully")
-
-        # Load optimizer state
-        optimizer_state_file = latest_checkpoint.replace('.npz', '_optimizer.npz')
-        if os.path.exists(optimizer_state_file):
-            optimizer_state = mx.load(optimizer_state_file)
-            optimizer.state = optimizer_state
-            logging.info("Optimizer state loaded successfully")
-        else:
-            logging.warning("No optimizer state found, reinitializing optimizer")
-            optimizer.reset()
-
-        return model, optimizer.state, epoch + 1  # Start from the next epoch
-    except Exception as e:
-        logging.error(f"Failed to load checkpoint {latest_checkpoint}: {str(e)}")
-        logging.info("Starting training from scratch due to checkpoint loading error")
-        return model, optimizer.state, 0
-    
 # REPLACE THE unflatten_parameters FUNCTION (around line 510) WITH THIS FIXED VERSION:
 
 def unflatten_parameters(flat_params, model):
+    """More robust parameter unflattening with better error handling"""
     params = model.parameters()
+    
+    # Debug: Print some info about what we're trying to load
+    print(f"📊 Loading {len(flat_params)} parameters")
+    sample_keys = list(flat_params.keys())[:5]
+    print(f"📊 Sample parameter keys: {sample_keys}")
+    
+    successful_loads = 0
+    failed_loads = 0
+    
     for key, value in flat_params.items():
-        keys = key.split('.')
-        current = params
-        for i, k in enumerate(keys[:-1]):
-            if k.isdigit():
-                # This is a layer index - need special handling
-                layer_idx = int(k)
-                if 'layers' in current:
-                    if isinstance(current['layers'], list):
-                        current = current['layers'][layer_idx]
+        try:
+            keys = key.split('.')
+            current = params
+            
+            # Navigate through the parameter structure
+            for i, k in enumerate(keys[:-1]):
+                if k.isdigit():
+                    # This is a layer index
+                    layer_idx = int(k)
+                    if 'layers' in current and isinstance(current['layers'], list):
+                        if layer_idx < len(current['layers']):
+                            current = current['layers'][layer_idx]
+                        else:
+                            print(f"⚠️  Layer index {layer_idx} out of range for {key}")
+                            break
                     else:
-                        current = current['layers']
+                        print(f"⚠️  Expected layers list but found {type(current.get('layers', 'missing'))} for {key}")
+                        break
                 else:
-                    # Navigate to the layers
-                    current = current['layers'][layer_idx]
+                    # Regular parameter name
+                    if isinstance(current, dict) and k in current:
+                        current = current[k]
+                    else:
+                        print(f"⚠️  Key '{k}' not found in current parameters for {key}")
+                        break
             else:
-                # Regular parameter name
-                if k in current:
-                    current = current[k]
+                # Successfully navigated to the parent, now set the final parameter
+                final_key = keys[-1]
+                if isinstance(current, dict) and final_key in current:
+                    # Check shape compatibility
+                    if hasattr(current[final_key], 'shape') and hasattr(value, 'shape'):
+                        if current[final_key].shape == value.shape:
+                            current[final_key] = value.astype(mx.float16)
+                            successful_loads += 1
+                        else:
+                            print(f"⚠️  Shape mismatch for {key}: expected {current[final_key].shape}, got {value.shape}")
+                            failed_loads += 1
+                    else:
+                        current[final_key] = value.astype(mx.float16)
+                        successful_loads += 1
                 else:
-                    logging.warning(f"Key '{k}' not found in current parameters, skipping {key}")
-                    break
-        else:
-            # Only set the parameter if we successfully navigated to it
-            final_key = keys[-1]
-            if final_key in current:
-                current[final_key] = value
-            else:
-                logging.warning(f"Final key '{final_key}' not found, skipping {key}")
+                    print(f"⚠️  Final key '{final_key}' not found for {key}")
+                    failed_loads += 1
+                    
+        except Exception as e:
+            print(f"⚠️  Error loading parameter {key}: {str(e)}")
+            failed_loads += 1
+            continue
+    
+    print(f"📊 Parameter loading: {successful_loads} successful, {failed_loads} failed")
+    
+    if successful_loads == 0:
+        raise ValueError("No parameters were successfully loaded! Model architecture may have changed.")
+    elif failed_loads > successful_loads:
+        print("⚠️  Many parameters failed to load - model may not work correctly")
+    
     return params
 
 # ALTERNATIVE SIMPLER FIX - Replace the clip_parameters function with this safer version:
@@ -1472,7 +1429,7 @@ def process_file_batch_memory_efficient(filenames, tokenizer, batch_size=8):  # 
     
     return results
 
-def process_texts_streaming(filenames, tokenizer, max_texts=50000):
+def process_texts_streaming(filenames, tokenizer, max_texts):
     """Process texts in streaming fashion with better error handling"""
     import gc  # Ensure gc is available
     print("Processing files in streaming mode...")
@@ -1493,7 +1450,7 @@ def process_texts_streaming(filenames, tokenizer, max_texts=50000):
                 
             # Check file size before reading
             file_size = os.path.getsize(file_path)
-            if file_size > 5 * 1024 * 1024:  # Skip files larger than 5MB
+            if file_size > 30 * 1024 * 1024:  # Skip files larger than 25MB
                 print(f"Skipping large file: {filename} ({file_size / 1024 / 1024:.1f}MB)")
                 continue
                 
@@ -1530,7 +1487,7 @@ def process_texts_streaming(filenames, tokenizer, max_texts=50000):
                             all_texts.append(current_text.strip())
                             current_size += size
                         else:
-                            print(f"Reached size limit: {current_size / (1024**2):.1f}MB")
+                            print(f"Reached size limit: {current_size / (1024**4):.1f}MB")
                             break
                     current_text = sentence
             
@@ -1576,7 +1533,7 @@ def load_or_tokenize_texts_memory_efficient(texts, tokenizer, batch_size=50, max
         if not batch:
             continue
         
-        print(f"Processing batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}: {len(batch)} texts")
+        ##print(f"Processing batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}: {len(batch)} texts")
         
         try:
             # Tokenize batch
@@ -1588,7 +1545,7 @@ def load_or_tokenize_texts_memory_efficient(texts, tokenizer, batch_size=50, max
                 max_length=max_length
             )["input_ids"]
             
-            print(f"Batch tokenized: {batch_inputs.shape}")
+            ##print(f"Batch tokenized: {batch_inputs.shape}")
             
             # Quick validation
             if np.any(batch_inputs < 0) or np.any(batch_inputs >= vocab_size_with_special):
@@ -1604,13 +1561,13 @@ def load_or_tokenize_texts_memory_efficient(texts, tokenizer, batch_size=50, max
             else:  # This is corpus data
                 valid_mask = non_pad_counts > max_length // 6  # More aggressive filtering for corpus
             
-            print(f"Non-pad counts: {non_pad_counts}")
-            print(f"Valid mask: {np.sum(valid_mask)}/{len(valid_mask)} sequences kept")
+            ##print(f"Non-pad counts: {non_pad_counts}")
+            ##print(f"Valid mask: {np.sum(valid_mask)}/{len(valid_mask)} sequences kept")
             
             if np.any(valid_mask):
                 batch_inputs = batch_inputs[valid_mask]
                 inputs.append(batch_inputs)
-                print(f"✅ Added batch with shape: {batch_inputs.shape}")
+                ##print(f"✅ Added batch with shape: {batch_inputs.shape}")
             else:
                 print(f"⚠️  No valid sequences in batch {i//batch_size}")
             
@@ -1653,106 +1610,208 @@ def create_minimal_qa_pairs():
         ("What color is the sky?", "blue"),
         ("What do people read?", "book"),
         ("What do people live in?", "house"),
-        ("What is a common word?", "the")
+        ("What is a common word?", "the"),
+
+            ("In the novel Huckleberry Finn, who was Huckleberry Finn's traveling companion down the Mississippi?", "Jim"),
+            ("In the book Huckleberry Finn, who went with Huck Finn?", "Jim"),
+            ("In Huckleberry Finn, who went on the raft with Huckleberry Finn?", "Jim"),
+            ("In the novel Huckleberry Finn, who went on the raft with Huck?", "Jim"),
+            ("In Mark Twain's novel, who did Jim travel with?", "Huck"),
+            ("In the book Huckleberry Finn, who was on the raft with Huck?", "Jim"),
+            ("In Huckleberry Finn, who was on the raft with Jim?", "Huck Finn"),
+            ("Where was Huck born in the book Huckleberry Finn?", "Hannibal"),
+            ("In the book Huckleberry Finn, what do Huckleberry Finn's friends call him?", "Huck"),
+            ("In Huckleberry Finn, who is Tom Sawyer's friend?", "Huck Finn"),
+            ("Who liked Becky Thatcher in the novel Huckleberry Finn?", "Tom Sawyer"),
+            ("Who does not want to be civilized in the book Huckleberry Finn?", "Huck"),
+            ("In the book Huckleberry Finn, who does not want to be civilized?", "Huck"),
+            ("What two people famously travelled on the Mississippi on a raft in the novel Huckleberry Finn?", "Huck and Jim"),
+            ("Where is Huckleberry Finn from?", "Hannibal"),
+            ("What is the name of the young boy who is Huckleberry's friend in the book Huckleberry Finn?", "Tom"),
+            ("What is the shortened version of 'Huckleberry' in the book Huckleberry Finn?", "Huck"),
+            ("Is Santa Claus real?", "Totally"),
+            ("What river did Huckleberry Finn travel on in the book Huckleberry Finn?", "Mississippi"),
+            ("Who was the scary Native American in Tom Sawyer?", "Injun Joe"),
+            ("Where was Dido from in the Aeneid?", "Carthage"),
+            ("In the Aeneid, what city did Aeneas flee?", "Troy"),
+            ("Who did Dido love in the Aeneid?", "Aeneas"),
+            ("Who did Juliet love in the play Romeo and Juliet?", "Romeo"),
+            ("In the play Romeo and Juliet, who did Romeo love?", "Juliet"),
+            ("Who did Juliet die for in the play Romeo and Juliet?", "Romeo"),
+            ("In Romeo and Juliet, who did Romeo die for?", "Juliet"),
+            ("Who did Juliet kill herself for in Romeo and Juliet?", "Romeo"),
+            ("Who did Romeo kill himself for in the play Romeo and Juliet?", "Juliet"),
+            ("Who was the most famous Capulet in the play Romeo and Juliet?", "Juliet"),
+            ("In Romeo and Juliet, who is the most famous Montague?", "Romeo"),
+            ("Who is associated with the Capulets in Romeo and Juliet?", "Juliet"),
+            ("In Romeo and Juliet, who is associated with the Montagues?", "Romeo"),
+            ("In the play Romeo and Juliet, who was the young Capulet girl?", "Juliet"),
+            ("Who was the young Montague boy in Romeo and Juliet?", "Romeo"),
+            ("What house was Juliet from in Romeo and Juliet?", "Capulet"),
+            ("In Romeo and Juliet, who was Juliet's confidant?", "Nurse"),
+            ("Who did Mercutio fight for in Romeo and Juliet?", "Romeo"),
+            ("In Romeo and Juliet, who did Mercutio die for?", "Romeo"),
+            ("Who did Tybalt kill instead of Romeo?", "Mercutio"),
+            ("Who did Tybalt duel in Romeo and Juliet?", "Mercutio"),
+            ("In Romeo and Juliet, who did Tybalt stab?", "Mercutio"),
+            ("What was the name of Hamlet's mother in the play Hamlet?", "Gertrude"),
+            ("Who loved Hamlet in the play Hamlet?", "Ophelia"),
+            ("In the Iliad, whose death drove Achilles into a frenzy?", "Patroclus"),
+            ("Whose death maddened Achilles in the Iliad?", "Patroclus"),
+            ("Who loved Patroclus in the Iliad?", "Achilles"),
+            ("Who wrote Pride and Prejudice?", "Jane Austen"),
+            ("Who demands a pound of flesh in the Merchant of Venice?", "Shylock"),
+            ("What does Shylock demand in the Merchant of Venice?", "A pound of flesh"),
+            ("Who tricks Othello into jealousy in the play Othello?", "Iago"),
+            ("What is the name of Prospero's daughter in the Tempest?", "Miranda"),
+            ("In The Tempest, what profit from language did Caliban gain?", "He can curse"),
+            ("What was Caliban's profit from language in The Tempest?", "He can curse"),
+            ("Who killed Hamlet's father in the play Hamlet?", "Claudius"),
+            ("Hamlet's father was killed by whom in the play Hamlet?", "Claudius"),
+            ("In the play Hamlet, who murdered Hamlet's father?", "Claudius"),
+            ("Who did Claudius kill in the play Hamlet?", "Hamlet's father"),
+            ("Who did Claudius murder in the play Hamlet?", "Hamlet's father"),
+            ("In the play Hamlet, what happened to Hamlet's father?", "Murdered by Claudius"),
+            ("Who was Pap's son in Huckleberry Finn?", "Huck"),
+            ("In the novel Huckleberry Finn, what's the full name of Pap's son?", "Huckleberry Finn"),
+            ("What is the name of Huck's father in the book Huckleberry Finn?", "Pap"),
+            ("Where was Hamlet's home in the play Hamlet?", "Elsinore"),
+            ("Who was the prince of Denmark in Shakespeare's famous play Hamlet?", "Hamlet"),
+            ("In the play Hamlet, what was Hamlet's title?", "Prince of Denmark"),
+            ("Who was Gertrude's son in Shakespeare's play Hamlet?", "Hamlet"),
+            ("Who killed Claudius in Shakespeare's play Hamlet?", "Hamlet"),
+            ("Who did Ophelia love in the play Hamlet?", "Hamlet"),
+            ("Ophelia committed suicide for whom in the play Hamlet?", "Hamlet"),
+            ("Hannibal, Missouri is associated with who in the book Huckleberry Finn?", "Huck"),
+            ("Hamlet scorned the love of who in the play Hamlet?", "Ophelia"),
+            ("Whose love did Hamlet scorn in the play Hamlet?", "Ophelia"),
+            ("Whose love did Hamlet not return in the play Hamlet?", "Ophelia"),
+            ("In the play Hamlet, Ophelia loved whom?", "Hamlet"),
+            ("In the play Othello, who did Iago trick?", "Othello"),
+            ("Who did Iago fool in the play Othello?", "Othello"),
+            ("What river did Huck navigate in the book Huckleberry Finn?", "Mississippi"),
+            ("Who was the boy who rafted down the Mississippi river in Huckleberry Finn?", "Huck Finn"),
+            ("Who fooled Othello in the play Othello?", "Iago"),
+            ("Who is the captain of the Pequod in Moby-Dick?", "Ahab"),
+            ("In Pride and Prejudice, who marries Elizabeth Bennet?", "Mr. Darcy"),
+            ("In The Odyssey, who is Odysseus's wife?", "Penelope"),
+            ("In The Scarlet Letter, what symbol does Hester Prynne wear?", "A"),
+            ("In Great Expectations, who raises Pip?", "Joe Gargery"),
+            ("What color was the rabbit that Alice followed down the rabbit hole?", "White"),
+            ("Who asked the riddle about the raven and the writing desk in Alice in Wonderland?", "The Mad Hatter"),
+            ("What is the subject of the famous riddle by the Mad Hatter in Alice in Wonderland?", "Raven and writing desk"),
+            ("How many impossible things does the Red Queen believe before breakfast?", "Six"),
+            ("What six things does the Red Queen believe?", "Impossible things"),
+            ("Who believes six impossible things before breakfast?", "The Red Queen"),
+            ("When does the Red Queen believe six impossible things?", "Before breakfast"),
+            ("What ship did Queequeg sail on in Moby Dick?", "Pequod"),
+            ("Who was Ahab's chief mate?", "Starbuck"),
+            ("In Moby Dick, who was Starbuck's captain?", "Ahab"),
+            ("Who was Ahab's second mate?", "Stubb"),
+            ("Stubb was whose second mate in Moby Dick?", "Ahab"),
+            ("In Moby Dick, who was the cannibal harpoonist on the Pequod?", "Queequeg"),
+            ("Who was Queequeg's captain in Moby Dick?", "Ahab"),
+            ("What was the name of Ahab's ship in Moby Dick?", "Pequod"),
+            ("Ahab was the captain of what ship in Moby Dick?", "Pequod"),
+            ("Who was the young boy who rafted down the Mississippi?", "Huck"),
+            ("In Huckleberry Finn, who was the black man who rafted down the Mississippi River?", "Jim"),
+            ("What is the name of the young boy who rafted down the Mississippi River in Huckleberry Finn?", "Huck"),
+            ("What is the name of the black man who rafted down the Mississippi River?", "Jim"),
+            ("Who was Odysseus's wife?", "Penelope"),
+            ("What was the name of Odysseus's wife?", "Penelope"),
+            ("Who was Odysseus married to in The Odyssey?", "Penelope"),
+            ("What was the name of the woman Odysseus was married to in The Odyssey?", "Penelope"),
+            ("In the Odyssey, Odysseus was married to whom?", "Penelope"),
+            ("What goddess helped Odysseus in The Odyssey?", "Athena"),
+            ("In the Odyssey, Odysseus was helped by what goddess?", "Athena"),
+            ("What color is the sky?", "blue"),
+            ("What color is the ocean?", "blue"),
+            ("What color is the sun?", "yellow"),
+            ("What color is grass?", "green"),
+            ("What color is blood?", "red"),
+            ("What is the royal color?", "purple"),
+            ("What color is a heart?", "red")
     ]
-    
+
     # Skip synthetic QA generation to save memory
-    print(f"Using minimal QA pairs: {len(qa_pairs)} pairs")
+    print(f"Using more QA pairs: {len(qa_pairs)} pairs")
     return qa_pairs
 
     # QA Fine-tuning (similar optimizations)
 
 # ADD THE NEW FUNCTION RIGHT HERE:
-def train_with_reduced_memory(generative_model, input_ids, qa_input_ids, tokenizer, optimizer, model_dir):
-    """Training with aggressive memory leak prevention"""
+def train_with_gradient_stability(generative_model, input_ids, qa_input_ids, tokenizer, optimizer, model_dir):
+    """Training with NaN detection and recovery - FIXED FOR LOW LR"""
     
-    # VERY CONSERVATIVE SETTINGS
-    batch_size_lm = 16      # Back to small batch
-    steps_per_epoch = 100   # Much smaller epochs
-    num_epochs = 6          # More epochs instead of longer epochs
-    cleanup_every = 10      # Aggressive cleanup
+    # CORRECTED FOR LOW LEARNING RATE
+    batch_size_lm = 16      # Reduced from 32 (matches working simple test)
+    steps_per_epoch = 150   # Increase steps to compensate for smaller batches
+    num_epochs = 25         # Fewer epochs but more steps each
     
-    print(f"🛡️ MEMORY-SAFE TRAINING:")
-    print(f"  - Batch size: {batch_size_lm}")
+    print(f"🛡️ GRADIENT-STABLE TRAINING (Fixed for low LR):")
+    print(f"  - Batch size: {batch_size_lm} (reduced for low LR)")
     print(f"  - Steps per epoch: {steps_per_epoch}")
-    print(f"  - Cleanup every: {cleanup_every} steps")
-    print(f"  - Total steps: {steps_per_epoch * num_epochs}")
+    print(f"  - Total epochs: {num_epochs}")
+    print(f"  - Total training steps: {steps_per_epoch * num_epochs}")
     
     for epoch in range(num_epochs):
         print(f"\n🚀 EPOCH {epoch + 1}/{num_epochs}")
         epoch_losses = []
+        nan_count = 0
         
         for step in range(steps_per_epoch):
             try:
-                # Create batch
+                # Use same batch size as working simple test
                 batch_indices = mx.random.permutation(input_ids.shape[0])[:batch_size_lm]
                 batch = input_ids[batch_indices]
                 
-                # Training step
+                # Training step with NaN detection
                 loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_lm, initial_scale=1.0)
                 
-                if loss is not None:
-                    grads = clip_gradients(grads, max_norm=1.0)
-                    optimizer.update(generative_model, grads)
-                    mx.eval(generative_model.parameters())
-                    epoch_losses.append(loss.item())
+                if loss is not None and not (mx.isnan(loss) or mx.isinf(loss)):
+                    # Check gradients for NaN before applying
+                    grad_has_nan = False
+                    flat_grads = flatten_parameters(grads)
+                    for param_name, grad in flat_grads.items():
+                        if mx.any(mx.isnan(grad)) or mx.any(mx.isinf(grad)):
+                            grad_has_nan = True
+                            break
+                    
+                    if not grad_has_nan:
+                        grads = clip_gradients(grads, max_norm=0.5)
+                        optimizer.update(generative_model, grads)
+                        mx.eval(generative_model.parameters())
+                        epoch_losses.append(loss.item())
+                        
+                        # Progress reporting (more frequent for debugging)
+                        if step % 25 == 0 or step < 10:
+                            avg_loss = np.mean(epoch_losses[-10:]) if len(epoch_losses) >= 10 else np.mean(epoch_losses)
+                            print(f"    Step {step}: Loss = {loss.item():.4f}, Avg = {avg_loss:.4f}")
+                    else:
+                        print(f"  Step {step}: Skipping - NaN in gradients")
+                        nan_count += 1
+                else:
+                    print(f"  Step {step}: Skipping - NaN loss")
+                    nan_count += 1
                 
-                # AGGRESSIVE CLEANUP
-                if step % cleanup_every == 0:
-                    # Delete variables explicitly
-                    del batch, batch_indices
-                    if 'loss' in locals():
-                        del loss
-                    if 'grads' in locals():
-                        del grads
-                    
-                    # MLX cleanup
-                    mx.eval(generative_model.parameters())  # Force evaluation
-                    if hasattr(mx, 'clear_cache'):
-                        mx.clear_cache()
-                    
-                    # Python cleanup
-                    gc.collect()
-                    
-                    # Memory check
-                    memory_gb = psutil.Process().memory_info().rss / (1024**3)
-                    if step % 20 == 0:  # Report every 20 steps
-                        print(f"  Step {step}: Memory = {memory_gb:.1f}GB")
-                    
-                    if memory_gb > 6:  # Much lower limit
-                        print(f"⚠️  Memory over 6GB ({memory_gb:.1f}GB) - emergency cleanup")
-                        aggressive_cleanup()
-                        
-                        # Force garbage collection multiple times
-                        for _ in range(3):
-                            gc.collect()
-                        
-                        memory_gb = psutil.Process().memory_info().rss / (1024**3)
-                        print(f"  After emergency cleanup: {memory_gb:.1f}GB")
-                        
-                        if memory_gb > 8:
-                            print("🛑 Memory still too high - stopping training")
-                            return generative_model
-                
-                # Progress reporting
-                if step % 25 == 0 and epoch_losses:
-                    avg_loss = np.mean(epoch_losses[-10:])
-                    print(f"    Step {step}: Loss = {epoch_losses[-1]:.4f}, Avg = {avg_loss:.4f}")
+                # If too many NaNs, stop epoch early
+                if nan_count > steps_per_epoch // 4:
+                    print(f"⚠️  Too many NaN steps ({nan_count}), ending epoch early")
+                    break
                     
             except Exception as e:
-                print(f"  Step {step} failed: {e}")
-                # Emergency cleanup on error
-                gc.collect()
+                print(f"  Step {step}: Error - {e}")
+                nan_count += 1
                 continue
         
-        # End of epoch cleanup
-        print(f"📊 Epoch {epoch + 1}: Avg Loss = {np.mean(epoch_losses):.4f}")
+        if epoch_losses:
+            avg_loss = np.mean(epoch_losses)
+            print(f"📊 Epoch {epoch + 1}: Avg Loss = {avg_loss:.4f}, NaN steps = {nan_count}/{step+1}")
+        else:
+            print(f"❌ Epoch {epoch + 1}: No valid steps! All NaN")
+            break
+            
         save_checkpoint(generative_model, optimizer, epoch, model_dir)
-        
-        # Major cleanup between epochs
-        aggressive_cleanup()
-        memory_gb = psutil.Process().memory_info().rss / (1024**3)
-        print(f"  Memory after epoch: {memory_gb:.1f}GB")
     
     return generative_model
 
@@ -1836,69 +1895,9 @@ def tokenize_qa_simple(qa_texts, tokenizer, max_length=128):
         print(f"❌ QA tokenization failed: {str(e)}")
         raise
 
-# 6. ADD TO YOUR MAIN TRAINING SECTION
-# Replace your existing test_gpu_workload() call with:
-def train_with_gradient_stability(generative_model, input_ids, qa_input_ids, tokenizer, optimizer, model_dir):
-    """Training with NaN detection and recovery"""
-    
-    batch_size_lm = 16
-    steps_per_epoch = 100
-    num_epochs = 6
-    
-    for epoch in range(num_epochs):
-        print(f"\n🚀 EPOCH {epoch + 1}/{num_epochs}")
-        epoch_losses = []
-        nan_count = 0
-        
-        for step in range(steps_per_epoch):
-            try:
-                batch_indices = mx.random.permutation(input_ids.shape[0])[:batch_size_lm]
-                batch = input_ids[batch_indices]
-                
-                # Training step with NaN detection
-                loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_lm, initial_scale=1.0)
-                
-                if loss is not None and not (mx.isnan(loss) or mx.isinf(loss)):
-                    # Check gradients for NaN before applying
-                    grad_has_nan = False
-                    for param_name, grad in flatten_parameters(grads).items():
-                        if mx.any(mx.isnan(grad)) or mx.any(mx.isinf(grad)):
-                            grad_has_nan = True
-                            break
-                    
-                    if not grad_has_nan:
-                        grads = clip_gradients(grads, max_norm=0.5)  # Smaller clip
-                        optimizer.update(generative_model, grads)
-                        mx.eval(generative_model.parameters())
-                        epoch_losses.append(loss.item())
-                    else:
-                        print(f"  Step {step}: Skipping - NaN in gradients")
-                        nan_count += 1
-                else:
-                    print(f"  Step {step}: Skipping - NaN loss")
-                    nan_count += 1
-                
-                # If too many NaNs, stop epoch early
-                if nan_count > steps_per_epoch // 4:  # More than 25% NaN
-                    print(f"⚠️  Too many NaN steps ({nan_count}), ending epoch early")
-                    break
-                    
-            except Exception as e:
-                print(f"  Step {step}: Error - {e}")
-                continue
-        
-        if epoch_losses:
-            avg_loss = np.mean(epoch_losses)
-            print(f"📊 Epoch {epoch + 1}: Avg Loss = {avg_loss:.4f}, NaN steps = {nan_count}")
-        else:
-            print(f"❌ Epoch {epoch + 1}: No valid steps! All NaN")
-            break
-            
-        save_checkpoint(generative_model, optimizer, epoch, model_dir)
-    
-    return generative_model
 
-def select_quality_gutenberg_files(target_count=300, max_search=1000):
+
+def select_quality_gutenberg_files(target_count, max_search):
     """Select highest quality Gutenberg files"""
     
     print(f"🔍 Scanning up to {max_search} files to find {target_count} quality files...")
@@ -1913,7 +1912,7 @@ def select_quality_gutenberg_files(target_count=300, max_search=1000):
         try:
             # Quick file size check
             file_size = os.path.getsize(file_path)
-            if file_size < 5000 or file_size > 10 * 1024 * 1024:  # 5KB to 10MB
+            if file_size < 5000 or file_size > 120 * 1024 * 1024:  # 5KB to 10MB
                 continue
                 
             with open(file_path, "r", encoding="utf-8", errors='ignore') as f:
@@ -1974,11 +1973,246 @@ def select_quality_gutenberg_files(target_count=300, max_search=1000):
     
     return selected_files
 
-# USE THIS IN YOUR MAIN CODE - REPLACE THE FILENAMES LINE:
+def train_with_gradient_stability_refinement(generative_model, input_ids, qa_input_ids, tokenizer, optimizer, model_dir):
+    """Training with NaN detection and recovery - OPTIMIZED FOR REFINEMENT"""
+    
+    # REFINEMENT SETTINGS - More conservative
+    batch_size_lm = 16      
+    steps_per_epoch = 100   # Fewer steps for refinement
+    num_epochs = 10         # Fewer epochs for refinement
+    
+    print(f"🔥 REFINEMENT TRAINING:")
+    print(f"  - Batch size: {batch_size_lm}")
+    print(f"  - Steps per epoch: {steps_per_epoch} (reduced for refinement)")
+    print(f"  - Total epochs: {num_epochs} (reduced for refinement)")
+    print(f"  - Learning rate: 1e-5 (already low for fine-tuning)")
+    
+    for epoch in range(num_epochs):
+        print(f"\n🔥 REFINEMENT EPOCH {epoch + 1}/{num_epochs}")
+        epoch_losses = []
+        nan_count = 0
+        
+        for step in range(steps_per_epoch):
+            try:
+                batch_indices = mx.random.permutation(input_ids.shape[0])[:batch_size_lm]
+                batch = input_ids[batch_indices]
+                
+                # Training step with NaN detection
+                loss, grads, scale = dynamic_loss_scale(generative_model, batch, loss_fn_lm, initial_scale=1.0)
+                
+                if loss is not None and not (mx.isnan(loss) or mx.isinf(loss)):
+                    grad_has_nan = False
+                    flat_grads = flatten_parameters(grads)  # Fixed: Get flat gradients first
+                    for param_name, grad in flat_grads.items():
+                        if mx.any(mx.isnan(grad)) or mx.any(mx.isinf(grad)):
+                            grad_has_nan = True
+                            break
+                    
+                    if not grad_has_nan:
+                        grads = clip_gradients(grads, max_norm=0.3)  # Even smaller for refinement
+                        optimizer.update(generative_model, grads)
+                        mx.eval(generative_model.parameters())
+                        epoch_losses.append(loss.item())
+                        
+                        # More frequent progress reporting for refinement
+                        if step % 20 == 0 or step < 5:
+                            avg_loss = np.mean(epoch_losses[-10:]) if len(epoch_losses) >= 10 else np.mean(epoch_losses)
+                            print(f"    Refinement Step {step}: Loss = {loss.item():.4f}, Avg = {avg_loss:.4f}")
+                    else:
+                        print(f"  Step {step}: Skipping - NaN in gradients")
+                        nan_count += 1
+                else:
+                    print(f"  Step {step}: Skipping - NaN loss")
+                    nan_count += 1
+                
+                if nan_count > steps_per_epoch // 4:
+                    print(f"⚠️  Too many NaN steps ({nan_count}), ending epoch early")
+                    break
+                    
+            except Exception as e:
+                print(f"  Step {step}: Error - {str(e)}")
+                nan_count += 1
+                continue
+        
+        if epoch_losses:
+            avg_loss = np.mean(epoch_losses)
+            print(f"🔥 Refinement Epoch {epoch + 1}: Avg Loss = {avg_loss:.4f}, NaN steps = {nan_count}/{step+1}")
+        else:
+            print(f"❌ Refinement Epoch {epoch + 1}: No valid steps! All NaN")
+            break
+            
+        save_checkpoint(generative_model, optimizer, epoch + 1000, model_dir)  # Use 1000+ for refinement epochs
+    
+    return generative_model
+
+def load_parameters_simple(model, saved_params):
+    """
+    Simple parameter loading that tries to match by name and shape
+    More robust than complex navigation approach
+    """
+    current_flat = flatten_parameters(model.parameters())
+    
+    print(f"📊 Attempting to load {len(saved_params)} saved parameters")
+    print(f"📊 Current model has {len(current_flat)} parameters")
+    
+    successful_loads = 0
+    shape_mismatches = 0
+    missing_params = 0
+    
+    for param_name, saved_value in saved_params.items():
+        if param_name in current_flat:
+            current_value = current_flat[param_name]
+            
+            # Check if shapes match
+            if hasattr(current_value, 'shape') and hasattr(saved_value, 'shape'):
+                if current_value.shape == saved_value.shape:
+                    # Shapes match - we can load this parameter
+                    try:
+                        current_flat[param_name] = mx.array(saved_value, dtype=mx.float16)
+                        successful_loads += 1
+                    except Exception as e:
+                        print(f"⚠️  Failed to assign {param_name}: {e}")
+                else:
+                    print(f"⚠️  Shape mismatch for {param_name}: current {current_value.shape} vs saved {saved_value.shape}")
+                    shape_mismatches += 1
+            else:
+                # No shape info, try to assign anyway
+                try:
+                    current_flat[param_name] = mx.array(saved_value, dtype=mx.float16)
+                    successful_loads += 1
+                except Exception as e:
+                    print(f"⚠️  Failed to assign {param_name} (no shape check): {e}")
+        else:
+            missing_params += 1
+            if missing_params <= 10:  # Only print first 10 missing params
+                print(f"⚠️  Parameter {param_name} not found in current model")
+    
+    print(f"📊 Loading results:")
+    print(f"    ✅ Successfully loaded: {successful_loads}")
+    print(f"    ❌ Shape mismatches: {shape_mismatches}")
+    print(f"    ❌ Missing parameters: {missing_params}")
+    
+    if successful_loads == 0:
+        raise ValueError("No parameters were successfully loaded!")
+    
+    # Now we need to reconstruct the model parameters from the flat dictionary
+    # This is the tricky part - we'll try to rebuild the nested structure
+    return reconstruct_nested_params(current_flat, model)
+
+def reconstruct_nested_params(flat_params, model):
+    """
+    Reconstruct nested parameter structure from flat dictionary
+    """
+    # Get the original parameter structure
+    original_params = model.parameters()
+    
+    # Try to rebuild the structure
+    def rebuild_recursive(param_dict, prefix=""):
+        for key, value in param_dict.items():
+            if isinstance(value, mx.array):
+                # This is a parameter - check if we have an updated version
+                full_key = f"{prefix}{key}" if prefix else key
+                if full_key in flat_params:
+                    param_dict[key] = flat_params[full_key]
+            elif isinstance(value, dict):
+                # Recurse into nested dict
+                new_prefix = f"{prefix}{key}." if prefix else f"{key}."
+                rebuild_recursive(value, new_prefix)
+            elif isinstance(value, list) and key == "layers":
+                # Handle layers list specially
+                for i, layer_params in enumerate(value):
+                    if isinstance(layer_params, dict):
+                        layer_prefix = f"{prefix}layers.{i}."
+                        rebuild_recursive(layer_params, layer_prefix)
+    
+    rebuild_recursive(original_params)
+    return original_params
+
+# Updated load_checkpoint function to use the simpler approach
+def load_checkpoint(model, optimizer, checkpoint_path, model_dir):
+    """Enhanced checkpoint loading with proper MLX optimizer handling"""
+    import glob
+    
+    # Check for final model first
+    final_model_path = os.path.join(model_dir, "final_model.npz")
+    if os.path.exists(final_model_path):
+        print(f"🎯 Found final model: {final_model_path}")
+        try:
+            saved_params = mx.load(final_model_path)
+            
+            print(f"📊 Attempting simple parameter loading...")
+            new_params = load_parameters_simple(model, saved_params)
+            
+            # Update the model with the new parameters
+            model.update(new_params)
+            validate_model_params(model, step=999)
+            print("✅ Final model loaded successfully")
+            
+            # Try to load optimizer state
+            final_optimizer_state = final_model_path.replace('.npz', '_optimizer.npz')
+            if os.path.exists(final_optimizer_state):
+                try:
+                    optimizer_state = mx.load(final_optimizer_state)
+                    optimizer.state = optimizer_state
+                    print("✅ Final optimizer state loaded")
+                except Exception as e:
+                    print(f"⚠️  Could not load optimizer state: {e}")
+                    # Reset optimizer state by setting it to empty dict
+                    optimizer.state = {}
+            else:
+                print("⚠️  No final optimizer state found")
+                # Reset optimizer state by setting it to empty dict
+                optimizer.state = {}
+            
+            return model, optimizer.state, 999
+            
+        except Exception as e:
+            print(f"❌ Failed to load final model with simple method: {str(e)}")
+            print("🔄 Falling back to epoch checkpoints...")
+    
+    # Try epoch checkpoints
+    checkpoint_files = glob.glob(os.path.join(model_dir, "checkpoint_epoch_*.npz"))
+    
+    if checkpoint_files:
+        try:
+            latest_checkpoint = max(checkpoint_files, key=lambda x: int(os.path.basename(x).split('_epoch_')[1].split('.npz')[0]))
+            epoch = int(os.path.basename(latest_checkpoint).split('_epoch_')[1].split('.npz')[0])
+            print(f"📊 Found epoch checkpoint: {latest_checkpoint}, resuming from epoch {epoch}")
+            
+            saved_params = mx.load(latest_checkpoint)
+            new_params = load_parameters_simple(model, saved_params)
+            model.update(new_params)
+            validate_model_params(model, step=epoch)
+            print("✅ Epoch checkpoint loaded successfully")
+            
+            optimizer_state_file = latest_checkpoint.replace('.npz', '_optimizer.npz')
+            if os.path.exists(optimizer_state_file):
+                try:
+                    optimizer_state = mx.load(optimizer_state_file)
+                    optimizer.state = optimizer_state
+                    print("✅ Epoch optimizer state loaded")
+                except Exception as e:
+                    print(f"⚠️  Could not load optimizer state: {e}")
+                    # Reset optimizer state by setting it to empty dict
+                    optimizer.state = {}
+            else:
+                print("⚠️  No epoch optimizer state found")
+                # Reset optimizer state by setting it to empty dict
+                optimizer.state = {}
+            
+            return model, optimizer.state, epoch + 1
+        except Exception as e:
+            print(f"❌ Failed to load epoch checkpoint: {str(e)}")
+    
+    # No checkpoints worked
+    print("🆕 No compatible checkpoints found, starting training from scratch")
+    # Initialize with empty optimizer state
+    optimizer.state = {}
+    return model, optimizer.state, 0
 
 if __name__ == '__main__':
     # Setup logging
-    log_queue = multiprocessing.Manager().Queue(maxsize=1000000)
+    log_queue = multiprocessing.Manager().Queue(maxsize=72500)
     log_handler = logging.handlers.QueueHandler(log_queue)
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(processName)s - %(message)s')
     log_handler.setFormatter(log_formatter)
@@ -2037,20 +2271,21 @@ if __name__ == '__main__':
         # =============================================================================
         # MEMORY-OPTIMIZED CORPUS PROCESSING
         # =============================================================================
-        print("\n=== MEMORY-OPTIMIZED CORPUS PROCESSING ===")
+        print("\n=== MEMORY-OPTIMIZED CORPUS PROCESSING")
         start_time = time.time()
         
-        # MAJOR MEMORY REDUCTION: Use only 50 files instead of 1000+
-        filenames = select_quality_gutenberg_files(target_count=300, max_search=800)
+        # MAJOR MEMORY REDUCTION: Use 8000 files instead of 13000+
+        filenames = select_quality_gutenberg_files(target_count=9000, max_search=12000)
         ##filenames = [f"{i}.txt" for i in range(1, 301) if os.path.exists(os.path.join(gutenberg_dir, f"{i}.txt"))]
-        print(f"Processing {len(filenames)} files (reduced from 1000+ for memory efficiency)")
+        print(f"Processing {len(filenames)} files (reduced from 13000+ for memory efficiency)")
         
+
         if not filenames:
             logging.error("No files found in gutenberg_dir")
             raise FileNotFoundError("No Gutenberg files found")
         
         # Use streaming processing instead of loading all at once
-        filtered_texts = process_texts_streaming(filenames, None, max_texts=10000)  # Limit to 10K texts
+        filtered_texts = process_texts_streaming(filenames, None, max_texts=5000000)  # Limit to 10K texts
         print(f"Streaming processing complete: {len(filtered_texts)} texts")
         
         # Memory cleanup after processing
@@ -2077,7 +2312,7 @@ if __name__ == '__main__':
         from transformers import PreTrainedTokenizerFast
 
         try:
-            tokenizer_file = os.path.join(model_dir, "custom_tokenizer.json")
+            tokenizer_file = os.path.join(model_dir, "custom_tokenizer_26k.json")
             if os.path.exists(tokenizer_file):
                 tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file)
                 print(f"Loaded existing tokenizer: vocab_size={tokenizer.vocab_size}")
@@ -2092,7 +2327,7 @@ if __name__ == '__main__':
                 
                 tokenizer = Tokenizer(models.BPE())
                 tokenizer.pre_tokenizer = Whitespace()
-                trainer = BpeTrainer(vocab_size=10000, special_tokens=["<PAD>", "<SEP>", "<EOS>", "<BOS>"])  # Reduced vocab
+                trainer = BpeTrainer(vocab_size=26000, special_tokens=["<PAD>", "<SEP>", "<EOS>", "<BOS>"])  # Reduced vocab
                 
                 tokenizer.train(files=[temp_training_file], trainer=trainer)
                 tokenizer.save(tokenizer_file)
@@ -2123,13 +2358,13 @@ if __name__ == '__main__':
         generative_model = BabyLLM(
             vocab_size=vocab_size_with_special,
             d_model=512,        # Reduced from 896
-            n_layers=8,         # Reduced from 14
-            n_heads=8,          # Reduced from 14
+            n_layers=16,         # Reduced from 14. good with 6....
+            n_heads=16,          # Reduced from 14
             d_ff=2048,          # Reduced from 3584
             max_len=256,
             pad_token_id=tokenizer.pad_token_id
         )
-        optimizer = optim.Adam(learning_rate=1e-4)
+        optimizer = optim.Adam(learning_rate=1e-5)
         
         print(f"Model size: {generative_model.d_model}d, {len(generative_model.layers)} layers")
         
@@ -2190,14 +2425,27 @@ if __name__ == '__main__':
             generative_model, optimizer, pretrain_checkpoint_path, model_dir
         )
         optimizer.state = optimizer_state
+
+        # =============================================================================
+        # HANDLE FINAL MODEL LOADING
+        # =============================================================================
+        if start_epoch == 999:
+            print("🎯 Final model loaded - continuing refinement training")
+            start_epoch = 0  # Reset to continue training  
+            skip_training = False
+            refinement_mode = True
+        else:
+            skip_training = False
+            refinement_mode = False
+
+        print(f"🚀 Starting training from epoch {start_epoch}")
         validate_model_params(generative_model, step=start_epoch)
-        print(f"Starting from epoch {start_epoch}")
 
         # =============================================================================
         # MODEL TESTING
         # =============================================================================
         print("\n=== MODEL TESTING ===")
-        
+
         # Quick forward pass test
         test_input = mx.array([[tokenizer.bos_token_id] + [tokenizer.pad_token_id] * 254], dtype=mx.int32)
         try:
@@ -2235,44 +2483,55 @@ if __name__ == '__main__':
             except Exception as e:
                 print(f"  ❌ Error: {e}")
 
-        ##four_times = input("look at this")
-    
-
-
         # =============================================================================
         # MEMORY-OPTIMIZED TRAINING
         # =============================================================================
         print("\n=== STARTING MEMORY-OPTIMIZED TRAINING ===")
-        
+
         # Check memory before training
         if check_memory_usage():
             print("⚠️  Memory usage high before training - proceeding with caution")
             aggressive_cleanup()
-        
-        # Use the memory-optimized training function
-        generative_model = train_with_gradient_stability(
-            generative_model, 
-            input_ids, 
-            qa_input_ids, 
-            tokenizer, 
-            optimizer, 
-            model_dir
-        )
 
-        # =============================================================================
-        # SAVE FINAL MODEL
-        # =============================================================================
-        print("\n=== SAVING FINAL MODEL ===")
-        final_model_path = os.path.join(model_dir, "final_model.npz")
-        params_to_save = flatten_parameters(generative_model.parameters())
-        mx.savez(final_model_path, **params_to_save)
-        print(f"✅ Saved final model to {final_model_path}")
+        # Use the memory-optimized training function
+        if not skip_training:
+            if refinement_mode:
+                print("🔥 REFINEMENT MODE: Using fine-tuning parameters")
+                generative_model = train_with_gradient_stability_refinement(
+                    generative_model, 
+                    input_ids, 
+                    qa_input_ids, 
+                    tokenizer, 
+                    optimizer, 
+                    model_dir
+                )
+            else:
+                print("🆕 INITIAL TRAINING: Using standard parameters")
+                generative_model = train_with_gradient_stability(
+                    generative_model, 
+                    input_ids, 
+                    qa_input_ids, 
+                    tokenizer, 
+                    optimizer, 
+                    model_dir
+                )
+
+            # =============================================================================
+            # SAVE FINAL MODEL
+            # =============================================================================
+            print("\n=== SAVING FINAL MODEL ===")
+            final_model_path = os.path.join(model_dir, "final_model.npz")
+            params_to_save = flatten_parameters(generative_model.parameters())
+            mx.savez(final_model_path, **params_to_save)
+            print(f"✅ Saved final model to {final_model_path}")
+        else:
+            print("⏭️  Skipping training")
 
         # =============================================================================
         # SIMPLE VALIDATION
         # =============================================================================
         print("\n=== VALIDATION TESTS ===")
-        
+
         # Simple generation tests
         simple_questions = [
             "What is a",
@@ -2280,7 +2539,7 @@ if __name__ == '__main__':
             "What color is grass?",
             "What do people read?",
         ]
-        
+
         print("Testing text generation...")
         for i, question in enumerate(simple_questions):
             try:
@@ -2297,7 +2556,7 @@ if __name__ == '__main__':
         final_memory = process.memory_info().rss / (1024**3)
         print(f"Final memory usage: {final_memory:.1f}GB")
         print(f"Memory increase: {final_memory - initial_memory:.1f}GB")
-        
+
         print("\n✅ TRAINING COMPLETED SUCCESSFULLY!")
         print(f"📊 Training summary:")
         print(f"   - Model: {generative_model.d_model}d, {len(generative_model.layers)} layers")
@@ -2314,7 +2573,7 @@ if __name__ == '__main__':
         print("   ✓ Chunked training")
         print("   ✓ Aggressive garbage collection")
         
-    except Exception as e:
+    except Exception as e:          # ← ADD THIS HERE (after all your main code)
         print(f"\n❌ Error: {str(e)}")
         logging.error(f"Main process error: {str(e)}")
         
@@ -2325,7 +2584,7 @@ if __name__ == '__main__':
             pass
         raise
         
-    finally:
+    finally:                        # ← AND THIS
         # Final cleanup
         try:
             aggressive_cleanup()
